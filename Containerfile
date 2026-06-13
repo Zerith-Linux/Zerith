@@ -4,4 +4,5 @@ RUN pacman -Syu --noconfirm \
     linux \
     mkinitcpio \
     grub \
+    ostree \
     dinit
