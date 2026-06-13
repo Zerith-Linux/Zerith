@@ -21,7 +21,6 @@ env:
   IMAGE_NAME: "${{ github.event.repository.name }}"
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
   DEFAULT_TAG: "latest"
-  FEDORA_VERSION: "42"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.brand_name}}-${{ inputs.stream_name }}
@@ -128,7 +127,7 @@ jobs:
             mkdir -p $mnt/usr/etc
 
             buildah unmount $ctr
-            buildah commit $ctr ghcr.io/zerith-linux/zerith:cleaned
+            buildah commit $ctr ghcr.io/zerith-linux/zerith:post
             buildah rm $ctr
           '
 
