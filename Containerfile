@@ -14,5 +14,3 @@ RUN mkdir -p /usr/etc && \
 RUN mkinitcpio \
     -k $(ls /usr/lib/modules | head -n1) \
     -g /boot/initramfs.img
-
-RUN rm -rf /etc
