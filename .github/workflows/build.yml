@@ -94,7 +94,7 @@ jobs:
             org.opencontainers.image.title=${{ env.IMAGE_NAME }}
             org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
-            org.opencontainers.image.version=${{ env.FEDORA_VERSION }}.{{date 'YYYYMMDD'}}
+            org.opencontainers.image.version={{date 'YYYYMMDD'}}
 
           sep-tags: " "
 
