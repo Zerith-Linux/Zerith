@@ -24,8 +24,7 @@ env:
   FEDORA_VERSION: "42"
 
 concurrency:
-  group: >-
-    ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.flavor }}
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.brand_name}}-${{ inputs.stream_name }}
   cancel-in-progress: true
 
 jobs:
