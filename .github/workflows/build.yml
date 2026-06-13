@@ -69,13 +69,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Mount BTRFS for podman storage
-        uses: ublue-os/container-storage-action@main
-        continue-on-error: true
-        with:
-          target-dir: /var/lib/containers
-          mount-opts: compress-force=zstd:2
-
       - name: Get current date
         id: date
         run: |
@@ -102,7 +95,6 @@ jobs:
             org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
             org.opencontainers.image.version=${{ env.FEDORA_VERSION }}.{{date 'YYYYMMDD'}}
-            containers.bootc=1
 
           sep-tags: " "
 
@@ -115,12 +107,19 @@ jobs:
 
       - name: Build image
         run: |
-          LABELS=$(echo '${{ steps.metadata.outputs.labels }}' | tr '\n' ' ' | sed 's/  */ /g')
+          mapfile -t LABELS_ARRAY < <(echo "${{ steps.metadata.outputs.labels }}")
+
+          LABEL_ARGS=()
+          for label in "${LABELS_ARRAY[@]}"; do
+            if [ -n "$label" ]; then
+              LABEL_ARGS+=("--label" "$label")
+            fi
+          done
 
           sudo -E buildah build \
             --file Containerfile \
             --build-arg-file build_args.txt \
-            $LABELS \
+            "${LABEL_ARGS[@]}" \
             --tag raw-img .
 
       - name: Tag image
