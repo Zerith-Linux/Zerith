@@ -115,12 +115,12 @@ jobs:
 
       - name: Build image
         run: |
+          LABELS=$(echo '${{ steps.metadata.outputs.labels }}' | tr '\n' ' ' | sed 's/  */ /g')
+
           sudo -E buildah build \
-            --pull=newer \
-            --layers \
             --file Containerfile \
             --build-arg-file build_args.txt \
-            --label-file <(printf '%s\n' "${{ steps.metadata.outputs.labels }}") \
+            $LABELS \
             --tag raw-img .
 
       - name: Tag image
