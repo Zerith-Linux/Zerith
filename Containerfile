@@ -9,6 +9,4 @@ RUN pacman -Syu --noconfirm \
 
 RUN mkdir -p /usr/etc && \
     cp -a /etc/. /usr/etc/ && \
-    rm -rf /usr/etc/machine-id /usr/etc/.*- 2>/dev/null || true
-
-RUN rm -rf /etc
+    rm /usr/etc/machine-id || true
