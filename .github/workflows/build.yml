@@ -1,0 +1,159 @@
+---
+name: Build container image
+
+on:
+  pull_request:
+    branches: ['*']
+
+  schedule:
+    - cron: '05 10 * * *' # 10:05 UTC daily
+
+  push:
+    branches: ['*']
+    paths-ignore:
+      - '**/README.md'
+      - 'releases.json'
+
+  workflow_dispatch:
+
+env:
+  IMAGE_DESC: "Zerith"
+  IMAGE_NAME: "${{ github.event.repository.name }}"
+  IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
+  DEFAULT_TAG: "latest"
+  FEDORA_VERSION: "42"
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.flavor }}
+  cancel-in-progress: true
+
+jobs:
+  build_push:
+    name: Build and push image
+
+    runs-on: ubuntu-24.04
+
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor:
+          - ""
+          - "nvidia"
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Change image name depending on build flavor
+        env:
+          BUILD_FLAVOR: ${{ matrix.flavor }}
+        run: |
+          if [ -n "$BUILD_FLAVOR" ]; then
+            echo "IMAGE_NAME=${IMAGE_NAME}-${BUILD_FLAVOR}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Lowercase image variables
+        run: |
+          echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Set tag prefix
+        if: github.ref_name != 'main'
+        run: |
+          echo "TAG_PREFIX=${{ github.ref_name }}." >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Mount BTRFS for podman storage
+        uses: ublue-os/container-storage-action@main
+        continue-on-error: true
+        with:
+          target-dir: /var/lib/containers
+          mount-opts: compress-force=zstd:2
+
+      - name: Get current date
+        id: date
+        run: |
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9
+        with:
+          images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
+
+          tags: |
+            type=raw,value=${{ env.TAG_PREFIX }}{{date 'YYYYMMDD'}}
+            type=raw,value=${{ env.TAG_PREFIX }}${{ env.DEFAULT_TAG }}
+            type=sha,enable=${{ github.event_name == 'pull_request' }}
+            type=ref,event=pr
+
+          labels: |
+            org.opencontainers.image.created=${{ steps.date.outputs.date }}
+            org.opencontainers.image.description=${{ env.IMAGE_DESC }}
+            org.opencontainers.image.documentation=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/${{ github.sha }}/README.md
+            org.opencontainers.image.source=https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.version=${{ env.FEDORA_VERSION }}.{{date 'YYYYMMDD'}}
+            containers.bootc=1
+
+          sep-tags: " "
+
+      - name: Prepare build args
+        run: |
+          cat > build_args.txt <<EOF
+          IMAGE=${{ env.IMAGE_NAME }}
+          FLAVOR=${{ matrix.flavor }}
+          EOF
+
+      - name: Build image
+        run: |
+          sudo -E buildah build \
+            --pull=newer \
+            --layers \
+            --file Containerfile \
+            --build-arg-file build_args.txt \
+            --label-file <(printf '%s\n' "${{ steps.metadata.outputs.labels }}") \
+            --tag raw-img .
+
+      - name: Tag image
+        run: |
+          IMAGE="localhost/raw-img"
+
+          for tag in ${{ steps.metadata.outputs.tags }}; do
+            echo "Tagging $tag"
+            podman tag \
+              "$IMAGE" \
+              "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:$tag"
+          done
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+
+          for tag in ${{ steps.metadata.outputs.tags }}; do
+            echo "Pushing $tag"
+
+            podman push \
+              --tls-verify=true \
+              --retry=5 \
+              --retry-delay=10s \
+              "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:$tag"
+          done
