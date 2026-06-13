@@ -120,15 +120,17 @@ jobs:
         id: cleanup
         run: |
           set -e
-          ctr=$(buildah from ${{ env.IMAGE_NAME }})
+          buildah unshare bash -c '
+            ctr=$(buildah from ghcr.io/zerith-linux/zerith:latest)
+            mnt=$(buildah mount $ctr)
 
-          mnt=$(buildah mount $ctr)
-          rm -rf $mnt/etc
-          mkdir -p $mnt/usr/etc
+            rm -rf $mnt/etc
+            mkdir -p $mnt/usr/etc
 
-          buildah unmount $ctr
-          buildah commit $ctr ${{ env.IMAGE_NAME }}:post
-          buildah rm $ctr
+            buildah unmount $ctr
+            buildah commit $ctr ghcr.io/zerith-linux/zerith:cleaned
+            buildah rm $ctr
+          '
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
