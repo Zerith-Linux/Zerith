@@ -121,7 +121,7 @@ jobs:
           buildah unshare bash -c '
             buildah images
       
-            ctr=$(buildah from containers-storage:ghcr.io/zerith-linux/zerith:latest)
+            ctr=$(buildah from containers-storage:${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG_PREFIX }}${{ env.DEFAULT_TAG }})
             mnt=$(buildah mount "$ctr")
       
             rm -rf "$mnt/etc"
