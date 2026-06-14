@@ -11,6 +11,8 @@ RUN mkdir -p /usr/etc && \
     cp -a /etc/. /usr/etc/ && \
     rm /usr/etc/machine-id || true
 
-RUN mkinitcpio \
-    -k $(ls /usr/lib/modules | head -n1) \
-    -g /boot/initramfs.img
+RUN echo 'HOOKS=(base udev modconf block filesystems keyboard fsck)' > /etc/mkinitcpio.conf
+
+RUN mkdir -p /boot
+
+RUN mkinitcpio -P
