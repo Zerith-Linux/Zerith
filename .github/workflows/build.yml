@@ -118,18 +118,15 @@ jobs:
       - name: Post-process image
         run: |
           set -e
-      
           buildah unshare bash -c '
-            echo "Local images:"
             buildah images
       
-            ctr=$(buildah from "${{ steps.build_image.outputs.image-with-tag }}")
+            ctr=$(buildah from containers-storage:ghcr.io/zerith-linux/zerith:latest)
             mnt=$(buildah mount "$ctr")
       
             rm -rf "$mnt/etc"
       
             buildah unmount "$ctr"
-      
             buildah commit "$ctr" post-processed
             buildah rm "$ctr"
       
