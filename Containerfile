@@ -2,7 +2,7 @@ FROM docker.io/artixlinux/artixlinux:base-dinit
 
 RUN pacman -Syu --noconfirm \
     linux \
-    mkinitcpio \
+    dracut \
     grub \
     ostree \
     dinit
@@ -13,6 +13,18 @@ RUN mkdir -p /usr/etc && \
 
 RUN echo 'HOOKS=(base udev modconf block filesystems keyboard fsck)' > /etc/mkinitcpio.conf
 
-RUN mkdir -p /boot
+RUN rm -rf /boot/*
 
-RUN mkinitcpio -P
+RUN set -eux; \
+    KVER="$(ls /usr/lib/modules | head -n1)"; \
+    depmod -a "$KVER"; \
+    export DRACUT_NO_XATTR=1; \
+    DRACUT_NO_XATTR=1 dracut \
+      --no-hostonly \
+      --kver "$KVER" \
+      --reproducible \
+      --zstd -v \
+      --add ostree \
+      --add fido2 \
+      -f "/usr/lib/modules/$KVER/initramfs.img"; \
+    chmod 0600 "/usr/lib/modules/$KVER/initramfs.img"
