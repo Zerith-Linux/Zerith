@@ -116,24 +116,22 @@ jobs:
           oci: false
 
       - name: Post-process image
-        id: cleanup
         run: |
           set -e
           buildah unshare bash -c '
-            # Use the first tag as a base for post-processing
-            FIRST_TAG=$(echo "${{ steps.metadata.outputs.tags }}" | cut -d" " -f1)
-            ctr=$(buildah from $FIRST_TAG)
-            mnt=$(buildah mount $ctr)
-
-            rm -rf $mnt/etc
-
-            buildah unmount $ctr
-            buildah commit $ctr post-processed
-            buildah rm $ctr
-
-            # Re-tag all tags to point to the post-processed image
+            buildah images
+      
+            ctr=$(buildah from containers-storage:${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG_PREFIX }}${{ env.DEFAULT_TAG }})
+            mnt=$(buildah mount "$ctr")
+      
+            rm -rf "$mnt/etc"
+      
+            buildah unmount "$ctr"
+            buildah commit "$ctr" post-processed
+            buildah rm "$ctr"
+      
             for tag in ${{ steps.metadata.outputs.tags }}; do
-              buildah tag post-processed $tag
+              buildah tag post-processed "$tag"
             done
           '
 
