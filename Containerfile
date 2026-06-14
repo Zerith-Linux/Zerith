@@ -1,28 +1,41 @@
-FROM docker.io/artixlinux/artixlinux:base-dinit
+FROM docker.io/archlinux:base AS uki-builder
 
 RUN pacman -Syu --noconfirm \
     linux \
     mkinitcpio \
-    limine \
-    systemd-ukify \
-    composefs-tools \
-    util-linux \
-    dinit
+    binutils \
+    util-linux
 
-RUN KVER="$(ls /usr/lib/modules | head -n1)"; \
-    depmod -a "$KVER"
+RUN mkdir -p /work/initramfs /out
 
-RUN KVER="$(ls /usr/lib/modules | head -n1)"; \
+COPY init /init
+RUN chmod +x /init
+
+RUN printf '%s\n' \
+    'MODULES=()' \
+    'BINARIES=(mount switch_root)' \
+    'FILES=(/init)' \
+    'HOOKS=()' \
+    > /etc/mkinitcpio.conf
+
+RUN KVER="$(ls /usr/lib/modules | head -n1)" && \
     mkinitcpio -k "$KVER" -g /work/initramfs/initramfs.img
 
-RUN mkdir /out
+RUN KVER="$(ls /usr/lib/modules | head -n1)" && \
+    objcopy \
+      --add-section .linux="/usr/lib/modules/$KVER/vmlinuz" \
+      --add-section .initrd="/work/initramfs/initramfs.img" \
+      /usr/lib/systemd/boot/efi/linuxx64.efi.stub \
+      /out/zerith.efi
 
-RUN KVER="$(ls /usr/lib/modules | head -n1)"; \
-    ukify build \
-      --linux="/usr/lib/modules/$KVER/vmlinuz" \
-      --initrd="/work/initramfs/initramfs.img" \
-      --cmdline="slot=a root=composefs quiet" \
-      --output="/out/zerith.efi"
+FROM docker.io/artixlinux/artixlinux:base-dinit
+COPY --from=uki-builder /out/zerith.efi /out/zerith.efi
+
+RUN pacman -Syu --noconfirm \
+    limine \
+    util-linux \
+    dinit \
+    composefs
 
 RUN mkdir -p /usr/etc && \
     cp -a /etc/. /usr/etc/ && \

@@ -1,0 +1,43 @@
+#!/bin/sh
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs dev /dev
+
+slot=a
+BOOTDEV=""
+
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        slot=*)
+            slot="${arg#slot=}"
+            ;;
+        boot=*)
+            BOOTDEV="${arg#boot=}"
+            ;;
+    esac
+done
+
+[ -n "$BOOTDEV" ] || {
+    echo "Missing boot="
+    exec sh
+}
+
+mkdir -p /mnt /sysroot
+
+mount "$BOOTDEV" /mnt || {
+    echo "Failed to mount boot device"
+    exec sh
+}
+
+BASE="/mnt/deploy/$slot"
+
+mount -t composefs \
+    "$BASE/root.cfs" \
+    /sysroot \
+    -o basedir=/mnt/deploy/shared/objects || {
+    echo "Failed to mount composefs"
+    exec sh
+}
+
+exec switch_root /sysroot /sbin/init
