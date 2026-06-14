@@ -40,4 +40,16 @@ mount -t composefs \
     exec sh
 }
 
+mkdir -p /sysroot/etc
+mkdir -p /sysroot/var/lib/etc/upper
+mkdir -p /sysroot/var/lib/etc/work
+
+mount -t overlay overlay /sysroot/etc \
+    -o lowerdir=/sysroot/usr/etc,\
+upperdir=/sysroot/var/lib/etc/upper,\
+workdir=/sysroot/var/lib/etc/work || {
+    echo "Failed to mount overlay /etc"
+    exec sh
+}
+
 exec switch_root /sysroot /sbin/init
