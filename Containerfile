@@ -9,7 +9,7 @@ RUN pacman -Syu --noconfirm \
     busybox \
     systemd
 
-RUN mkdir -p /work/initramfs/{bin,dev,proc,sys,mnt,sysroot,out}
+RUN mkdir -p /work/initramfs/{bin,dev,proc,sys,mnt,sysroot,out} /out
 
 RUN cp /usr/bin/busybox /work/initramfs/bin/ && \
     ln -s busybox /work/initramfs/bin/sh && \
