@@ -7,6 +7,7 @@ RUN pacman -Syu --noconfirm \
     binutils \
     util-linux \
     busybox \
+    cpio \
     systemd
 
 RUN mkdir -p /work/initramfs/{bin,dev,proc,sys,mnt,sysroot,out} /out
@@ -23,7 +24,9 @@ RUN cd /work/initramfs && \
 RUN KVER="$(ls /usr/lib/modules | head -n1)" && \
     objcopy \
       --add-section .linux="/usr/lib/modules/$KVER/vmlinuz" \
+      --change-section-vma .linux=0x2000000 \
       --add-section .initrd="/out/initramfs.img" \
+      --change-section-vma .initrd=0x3000000 \
       /usr/lib/systemd/boot/efi/linuxx64.efi.stub \
       /out/zerith.efi
 
