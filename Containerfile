@@ -32,7 +32,7 @@ RUN for b in /work/initramfs/bin/busybox \
         done; \
     done
 
-# only the modules we need, with their dependency closure
+# only the modules we need, with their dependency closure (shipped UNCOMPRESSED)
 RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
     mkdir -p "/work/initramfs/usr/lib/modules/$KVER" && \
     for f in modules.builtin modules.builtin.modinfo modules.order; do \
@@ -45,8 +45,10 @@ RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
         dst="/work/initramfs/usr/lib/modules/$KVER/$rel"; \
         mkdir -p "$(dirname "$dst")"; cp "$ko" "$dst"; \
     done && \
+    find "/work/initramfs/usr/lib/modules/$KVER" -name '*.ko.zst' -exec zstd -d --rm {} \; && \
     depmod -b /work/initramfs "$KVER"
 
+# sanity check: every required module must be builtin or present in the initramfs
 RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
     for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do \
         if grep -qE "(^|/)${m}\.ko" "/usr/lib/modules/$KVER/modules.builtin"; then \
