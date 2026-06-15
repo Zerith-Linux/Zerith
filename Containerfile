@@ -31,7 +31,7 @@ RUN KVER="$(ls /usr/lib/modules | head -n1)" && \
       /out/zerith.efi
 
 FROM docker.io/artixlinux/artixlinux:base-dinit
-COPY --from=uki-builder /out/zerith.efi /out/zerith.efi
+COPY --from=uki-builder /out/zerith.efi /usr/lib/uki/zerith.efi
 
 RUN pacman -Syu --noconfirm \
     limine \
