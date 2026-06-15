@@ -5,7 +5,7 @@ RUN chmod +x /init
 RUN pacman -Syu --noconfirm \
     linux binutils util-linux busybox cpio systemd composefs kmod zstd
 
-RUN mkdir -p /work/initramfs/{bin,sbin,dev,proc,sys,mnt,sysroot,run,out} && \
+RUN mkdir -p /work/initramfs/{bin,sbin,dev,proc,sys,mnt,sysroot,run} /out && \
     ln -s usr/lib /work/initramfs/lib && \
     ln -s usr/lib /work/initramfs/lib64 && \
     mkdir -p /work/initramfs/usr/lib
