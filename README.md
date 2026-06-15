@@ -2,6 +2,8 @@
 
 Zerith is a next-generation, immutable Linux distribution designed for robustness, security, and atomic updates. It leverages modern storage technologies like **composefs** and **EROFS** to provide a strictly read-only root filesystem with efficient deduplication and cryptographic verification.
 
+The goal of Zerith is to provide a curated and opinionated experience that is fully set up and ready to go.
+
 ## Core Architecture
 
 - **Immutable Core:** The root filesystem is mounted as a read-only `composefs` volume. This ensures the system remains in a known-good state and is protected against accidental or malicious modification.
