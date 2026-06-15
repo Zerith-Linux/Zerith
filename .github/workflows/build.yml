@@ -125,6 +125,16 @@ jobs:
             mnt=$(buildah mount "$ctr")
       
             rm -rf "$mnt/etc"
+            rm -rf "$mnt/home"
+            rm -rf "$mnt/var"
+            rm -rf "$mnt/dev"
+            rm -rf "$mnt/proc"
+            rm -rf "$mnt/sys"
+            rm -rf "$mnt/run"
+            rm -rf "$mnt/tmp"
+            rm -rf "$mnt/mnt"
+            rm -rf "$mnt/srv"
+            rm -rf "$mnt/root"
       
             buildah unmount "$ctr"
             buildah commit "$ctr" post-processed
