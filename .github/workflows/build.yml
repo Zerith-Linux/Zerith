@@ -120,26 +120,24 @@ jobs:
           set -e
           buildah unshare bash -c '
             buildah images
-      
+
             ctr=$(buildah from containers-storage:${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG_PREFIX }}${{ env.DEFAULT_TAG }})
             mnt=$(buildah mount "$ctr")
-      
-            rm -rf "$mnt/etc"
-            rm -rf "$mnt/home"
-            rm -rf "$mnt/var"
-            rm -rf "$mnt/dev"
-            rm -rf "$mnt/proc"
-            rm -rf "$mnt/sys"
-            rm -rf "$mnt/run"
-            rm -rf "$mnt/tmp"
-            rm -rf "$mnt/mnt"
-            rm -rf "$mnt/srv"
-            rm -rf "$mnt/root"
-      
+
+            for d in etc var home dev proc sys run tmp mnt; do
+                rm -rf "$mnt/$d"
+                mkdir -p "$mnt/$d"
+            done
+            chmod 1777 "$mnt/tmp"
+
+            rm -rf "$mnt/root" "$mnt/srv"
+            ln -s var/roothome "$mnt/root"
+            ln -s var/srv      "$mnt/srv"
+
             buildah unmount "$ctr"
             buildah commit "$ctr" post-processed
             buildah rm "$ctr"
-      
+
             for tag in ${{ steps.metadata.outputs.tags }}; do
               buildah tag post-processed "$tag"
             done
