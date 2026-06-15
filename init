@@ -49,8 +49,14 @@ mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
     || { echo "composefs mount failed"; exec sh; }
 
 # writable state over the read-only root (must mount /var BEFORE the /etc overlay)
-mount -o subvol=@var  "$BOOTDEV" /sysroot/var  || { echo "var mount failed";  exec sh; }
-mount -o subvol=@home "$BOOTDEV" /sysroot/home || { echo "home mount failed"; exec sh; }
+mount -t btrfs -o subvol=@var  "$BOOTDEV" /sysroot/var  || { echo "var mount failed";  exec sh; }
+mount -t btrfs -o subvol=@home "$BOOTDEV" /sysroot/home || { echo "home mount failed"; exec sh; }
+
+# first boot / after factory reset: empty @var -> seed it from the read-only factory copy
+if [ -z "$(ls -A /sysroot/var 2>/dev/null)" ]; then
+    echo "seeding /var from factory"
+    cp -a /sysroot/usr/share/factory/var/. /sysroot/var/
+fi
 
 # /etc overlay — upper/work live on persistent @var, so /etc survives A/B updates
 mkdir -p /sysroot/var/lib/etc/upper /sysroot/var/lib/etc/work

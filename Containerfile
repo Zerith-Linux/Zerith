@@ -12,7 +12,7 @@ RUN mkdir -p /work/initramfs/{bin,sbin,dev,proc,sys,mnt,sysroot,run} /out && \
 
 # busybox + applets
 RUN cp /usr/bin/busybox /work/initramfs/bin/ && \
-    for a in sh mount cat mkdir ls echo sleep switch_root insmod; do \
+    for a in sh mount cat mkdir ls echo sleep switch_root insmod cp; do \
         ln -sf busybox /work/initramfs/bin/$a; \
     done
 
@@ -79,7 +79,19 @@ RUN pacman -Syu --noconfirm \
     limine \
     util-linux \
     dinit \
-    composefs
+    composefs \
+    fuse-overlayfs \
+    podman
+
+RUN mkdir -p /usr/etc/dinit.d && \
+    printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
+
+RUN mkdir -p /usr/lib/tmpfiles.d && \
+    printf 'd /var/log/dinit 0755 root root -\n' > /usr/lib/tmpfiles.d/zerith-dinit.conf
+
+RUN rm -rf /var/lib/pacman/sync/* /var/tmp/* /var/lib/dbus/machine-id && \
+    find /var/cache /var/log -type f -delete && \
+    mkdir -p /usr/share/factory && cp -a /var /usr/share/factory/var
 
 RUN mkdir -p /usr/etc && \
     cp -a /etc/. /usr/etc/ && \
