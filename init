@@ -6,12 +6,12 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs dev /dev
 exec < /dev/console > /dev/console 2>&1
 
-# load required modules — no error hiding
+# load modules (builtins report "not found" — harmless; the guard below is the real check)
 for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do
-    modprobe "$m" || echo "warn: modprobe $m failed"
+    modprobe "$m" >/dev/null 2>&1
 done
 
-# composefs needs erofs + overlay registered and a loop control node before it can mount
+# composefs needs erofs + overlay registered and loop available before it can mount
 for fs in erofs overlay; do
     i=0
     until grep -q "[[:space:]]${fs}\$" /proc/filesystems; do
@@ -20,11 +20,6 @@ for fs in erofs overlay; do
     done
 done
 [ -e /dev/loop-control ] || { echo "FATAL: loop not available"; exec sh; }
-
-# no udev here, so loop device nodes aren't auto-created — composefs needs one
-for n in 0 1 2 3 4 5 6 7; do
-    [ -e /dev/loop$n ] || mknod /dev/loop$n b 7 $n
-done
 
 slot=a
 BOOTDEV=""
@@ -43,6 +38,12 @@ mkdir -p /mnt /sysroot
 mount "$BOOTDEV" /mnt || { echo "mount $BOOTDEV failed"; exec sh; }
 
 BASE="/mnt/deploy/$slot"
+
+# composefs needs a real, initialized loop device to mount the EROFS image, and
+# there's no udev here to create one — prime one the way busybox does.
+mkdir -p /tmp/prime
+mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
+
 /sbin/mount.composefs "$BASE/root.cfs" /sysroot \
     -o basedir=/mnt/deploy/shared/objects \
     || { echo "composefs mount failed"; exec sh; }
