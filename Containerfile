@@ -47,6 +47,18 @@ RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
     done && \
     depmod -b /work/initramfs "$KVER"
 
+RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
+    for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do \
+        if grep -qE "(^|/)${m}\.ko" "/usr/lib/modules/$KVER/modules.builtin"; then \
+            echo "ok (builtin): $m"; \
+        elif find "/work/initramfs/usr/lib/modules/$KVER" -name "${m}.ko*" | grep -q .; then \
+            echo "ok (module):  $m"; \
+        else \
+            echo "FATAL: '$m' is neither builtin nor copied into the initramfs" >&2; \
+            exit 1; \
+        fi; \
+    done
+
 RUN cp /init /work/initramfs/init && chmod +x /work/initramfs/init && \
     cd /work/initramfs && \
     find . -print0 | cpio --null -ov --format=newc | gzip -9 > /out/initramfs.img
