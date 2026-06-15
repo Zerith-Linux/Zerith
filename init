@@ -6,9 +6,20 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs dev /dev
 exec < /dev/console > /dev/console 2>&1
 
+# load required modules — no error hiding
 for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do
-    /sbin/modprobe "$m" 2>/dev/null
+    modprobe "$m" || echo "warn: modprobe $m failed"
 done
+
+# composefs needs erofs + overlay registered and a loop control node before it can mount
+for fs in erofs overlay; do
+    i=0
+    until grep -q "[[:space:]]${fs}\$" /proc/filesystems; do
+        i=$((i+1)); [ "$i" -ge 5 ] && { echo "FATAL: $fs never registered"; exec sh; }
+        sleep 1
+    done
+done
+[ -e /dev/loop-control ] || { echo "FATAL: loop not available"; exec sh; }
 
 slot=a
 BOOTDEV=""
