@@ -21,6 +21,11 @@ for fs in erofs overlay; do
 done
 [ -e /dev/loop-control ] || { echo "FATAL: loop not available"; exec sh; }
 
+# no udev here, so loop device nodes aren't auto-created — composefs needs one
+for n in 0 1 2 3 4 5 6 7; do
+    [ -e /dev/loop$n ] || mknod /dev/loop$n b 7 $n
+done
+
 slot=a
 BOOTDEV=""
 for arg in $(cat /proc/cmdline); do

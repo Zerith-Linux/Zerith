@@ -12,7 +12,7 @@ RUN mkdir -p /work/initramfs/{bin,sbin,dev,proc,sys,mnt,sysroot,run} /out && \
 
 # busybox + applets
 RUN cp /usr/bin/busybox /work/initramfs/bin/ && \
-    for a in sh mount cat mkdir ls echo sleep switch_root insmod; do \
+    for a in sh mount cat mkdir ls echo sleep switch_root insmod mknod; do \
         ln -sf busybox /work/initramfs/bin/$a; \
     done
 
