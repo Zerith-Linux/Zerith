@@ -3,25 +3,52 @@ COPY init /init
 RUN chmod +x /init
 
 RUN pacman -Syu --noconfirm \
-    linux \
-    binutils \
-    util-linux \
-    busybox \
-    cpio \
-    systemd
+    linux binutils util-linux busybox cpio systemd composefs kmod zstd
 
-RUN mkdir -p /work/initramfs/{bin,dev,proc,sys,mnt,sysroot,out} /out
+RUN mkdir -p /work/initramfs/{bin,sbin,dev,proc,sys,mnt,sysroot,run,out} && \
+    ln -s usr/lib /work/initramfs/lib && \
+    ln -s usr/lib /work/initramfs/lib64 && \
+    mkdir -p /work/initramfs/usr/lib
 
+# busybox + applets
 RUN cp /usr/bin/busybox /work/initramfs/bin/ && \
-    ln -s busybox /work/initramfs/bin/sh && \
-    ln -s busybox /work/initramfs/bin/mount
+    for a in sh mount cat mkdir ls echo sleep switch_root insmod; do \
+        ln -sf busybox /work/initramfs/bin/$a; \
+    done
 
-RUN cp /init /work/initramfs/init
+# helper: copy a binary's shared libs into the initramfs
+RUN cat > /usr/local/bin/cplibs <<'EOF'
+#!/bin/sh
+for l in $(ldd "$1" 2>/dev/null | awk '/=>/{print $3}/ld-linux/{print $1}'); do
+  [ -f "$l" ] || continue
+  mkdir -p "/work/initramfs$(dirname "$l")"
+  cp -Lu "$l" "/work/initramfs$l"
+done
+EOF
+RUN chmod +x /usr/local/bin/cplibs && cplibs /usr/bin/busybox
 
-RUN cd /work/initramfs && \
+# real modprobe (handles zstd-compressed modules + deps) and mount.composefs
+RUN cp "$(command -v modprobe)" /work/initramfs/sbin/modprobe && \
+    cplibs /work/initramfs/sbin/modprobe && \
+    MC="$(command -v mount.composefs || echo /usr/sbin/mount.composefs)" && \
+    cp "$MC" /work/initramfs/sbin/mount.composefs && \
+    cplibs /work/initramfs/sbin/mount.composefs
+
+# copy only the modules we need, with their dependency closure
+RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
+    for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do \
+        modprobe -S "$KVER" -D "$m" 2>/dev/null; \
+    done | awk '/^insmod/{print $2}' | sort -u | while read ko; do \
+        dst="/work/initramfs/usr/lib/modules/$KVER/${ko#/usr/lib/modules/$KVER/}"; \
+        mkdir -p "$(dirname "$dst")"; cp "$ko" "$dst"; \
+    done && \
+    depmod -b /work/initramfs "$KVER"
+
+RUN cp /init /work/initramfs/init && chmod +x /work/initramfs/init && \
+    cd /work/initramfs && \
     find . -print0 | cpio --null -ov --format=newc | gzip -9 > /out/initramfs.img
 
-RUN KVER="$(ls /usr/lib/modules | head -n1)" && \
+RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
     objcopy \
       --add-section .linux="/usr/lib/modules/$KVER/vmlinuz" \
       --change-section-vma .linux=0x2000000 \

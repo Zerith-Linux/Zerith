@@ -1,55 +1,37 @@
 #!/bin/sh
-
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs dev /dev
 
-slot=a
-BOOTDEV=""
-
-for arg in $(cat /proc/cmdline); do
-    case "$arg" in
-        slot=*)
-            slot="${arg#slot=}"
-            ;;
-        boot=*)
-            BOOTDEV="${arg#boot=}"
-            ;;
-    esac
+for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do
+    /sbin/modprobe "$m" 2>/dev/null
 done
 
-[ -n "$BOOTDEV" ] || {
-    echo "Missing boot="
-    exec sh
-}
+slot=a
+BOOTDEV=""
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        slot=*) slot="${arg#slot=}" ;;
+        boot=*) BOOTDEV="${arg#boot=}" ;;
+    esac
+done
+[ -n "$BOOTDEV" ] || { echo "Missing boot="; exec sh; }
+
+n=0
+while [ ! -b "$BOOTDEV" ] && [ "$n" -lt 10 ]; do sleep 1; n=$((n+1)); done
 
 mkdir -p /mnt /sysroot
-
-mount "$BOOTDEV" /mnt || {
-    echo "Failed to mount boot device"
-    exec sh
-}
+mount "$BOOTDEV" /mnt || { echo "mount $BOOTDEV failed"; exec sh; }
 
 BASE="/mnt/deploy/$slot"
+/sbin/mount.composefs "$BASE/root.cfs" /sysroot \
+    -o basedir=/mnt/deploy/shared/objects \
+    || { echo "composefs mount failed"; exec sh; }
 
-mount -t composefs \
-    "$BASE/root.cfs" \
-    /sysroot \
-    -o basedir=/mnt/deploy/shared/objects || {
-    echo "Failed to mount composefs"
-    exec sh
-}
-
-mkdir -p /sysroot/etc
-mkdir -p /sysroot/var/lib/etc/upper
-mkdir -p /sysroot/var/lib/etc/work
-
+mkdir -p /sysroot/etc /sysroot/var/lib/etc/upper /sysroot/var/lib/etc/work
 mount -t overlay overlay /sysroot/etc \
-    -o lowerdir=/sysroot/usr/etc,\
-upperdir=/sysroot/var/lib/etc/upper,\
-workdir=/sysroot/var/lib/etc/work || {
-    echo "Failed to mount overlay /etc"
-    exec sh
-}
+    -o lowerdir=/sysroot/usr/etc,upperdir=/sysroot/var/lib/etc/upper,workdir=/sysroot/var/lib/etc/work \
+    || { echo "etc overlay failed"; exec sh; }
 
 exec switch_root /sysroot /sbin/init
