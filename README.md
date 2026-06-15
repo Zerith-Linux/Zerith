@@ -18,6 +18,7 @@ The goal of Zerith is to provide a curated and opinionated experience that is fu
 
 ## Key Technologies
 
+- **Limine:** A modern, advanced, and portable bootloader used to boot the system.
 - **UKIs (Unified Kernel Images):** Combined kernel, initramfs, and stub in a single EFI executable for simplified and secure booting.
 - **EROFS:** An ultra-efficient read-only filesystem used for the underlying storage images.
 - **Btrfs:** Used for the underlying persistent storage to provide subvolumes and snapshot support.
