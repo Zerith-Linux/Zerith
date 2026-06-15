@@ -16,23 +16,21 @@ RUN cp /usr/bin/busybox /work/initramfs/bin/ && \
         ln -sf busybox /work/initramfs/bin/$a; \
     done
 
-# helper: copy a binary's shared libs into the initramfs
-RUN cat > /usr/local/bin/cplibs <<'EOF'
-#!/bin/sh
-for l in $(ldd "$1" 2>/dev/null | awk '/=>/{print $3}/ld-linux/{print $1}'); do
-  [ -f "$l" ] || continue
-  mkdir -p "/work/initramfs$(dirname "$l")"
-  cp -Lu "$l" "/work/initramfs$l"
-done
-EOF
-RUN chmod +x /usr/local/bin/cplibs && cplibs /usr/bin/busybox
-
 # real modprobe (handles zstd-compressed modules + deps) and mount.composefs
 RUN cp "$(command -v modprobe)" /work/initramfs/sbin/modprobe && \
-    cplibs /work/initramfs/sbin/modprobe && \
     MC="$(command -v mount.composefs || echo /usr/sbin/mount.composefs)" && \
-    cp "$MC" /work/initramfs/sbin/mount.composefs && \
-    cplibs /work/initramfs/sbin/mount.composefs
+    cp "$MC" /work/initramfs/sbin/mount.composefs
+
+# copy shared libs for every dynamic binary we added
+RUN for b in /work/initramfs/bin/busybox \
+             /work/initramfs/sbin/modprobe \
+             /work/initramfs/sbin/mount.composefs; do \
+        for l in $(ldd "$b" 2>/dev/null | awk '/=>/{print $3} /ld-linux/{print $1}'); do \
+            [ -f "$l" ] || continue; \
+            mkdir -p "/work/initramfs$(dirname "$l")"; \
+            cp -Lu "$l" "/work/initramfs$l"; \
+        done; \
+    done
 
 # copy only the modules we need, with their dependency closure
 RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
