@@ -1,8 +1,10 @@
 #!/bin/sh
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs dev /dev
+exec < /dev/console > /dev/console 2>&1
 
 for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do
     /sbin/modprobe "$m" 2>/dev/null
@@ -29,9 +31,15 @@ BASE="/mnt/deploy/$slot"
     -o basedir=/mnt/deploy/shared/objects \
     || { echo "composefs mount failed"; exec sh; }
 
-mkdir -p /sysroot/etc /sysroot/var/lib/etc/upper /sysroot/var/lib/etc/work
+# writable state over the read-only root (must mount /var BEFORE the /etc overlay)
+mount -o subvol=@var  "$BOOTDEV" /sysroot/var  || { echo "var mount failed";  exec sh; }
+mount -o subvol=@home "$BOOTDEV" /sysroot/home || { echo "home mount failed"; exec sh; }
+
+# /etc overlay — upper/work live on persistent @var, so /etc survives A/B updates
+mkdir -p /sysroot/var/lib/etc/upper /sysroot/var/lib/etc/work
 mount -t overlay overlay /sysroot/etc \
     -o lowerdir=/sysroot/usr/etc,upperdir=/sysroot/var/lib/etc/upper,workdir=/sysroot/var/lib/etc/work \
     || { echo "etc overlay failed"; exec sh; }
 
+mount -o bind /dev /sysroot/dev
 exec switch_root /sysroot /sbin/init
