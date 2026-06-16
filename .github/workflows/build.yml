@@ -74,7 +74,7 @@ jobs:
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Generate deploy id
-        id: deploy_id
+        id: slot_id
         run: echo "id=${GITHUB_SHA:0:8}$(openssl rand -hex 4)" >> "$GITHUB_OUTPUT"
 
       - name: Generate image metadata
@@ -98,7 +98,7 @@ jobs:
             org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
             org.opencontainers.image.version={{date 'YYYYMMDD'}}
-            org.zerith.deploy-id=${{ steps.deploy_id.outputs.id }}
+            org.zerith.slot-id=${{ steps.slot_id.outputs.id }}
 
           sep-tags: " "
 
@@ -112,7 +112,7 @@ jobs:
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
-            DEPLOY_ID=${{ steps.deploy_id.outputs.id }}
+            SLOT_ID=${{ steps.slot_id.outputs.id }}
           oci: false
 
       - name: Post-process image

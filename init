@@ -35,7 +35,6 @@ done
 [ -e /dev/loop-control ] || die "loop not available"
 
 # --- pick slot, locate the boot device -----------------------------------------
-slot=a
 BOOTDEV="LABEL=zerith"
 for arg in $(cat /proc/cmdline); do
     case "$arg" in slot=*) slot="${arg#slot=}" ;; esac

@@ -1,8 +1,8 @@
-ARG DEPLOY_ID
+ARG SLOT_ID
 
 FROM docker.io/archlinux:base AS uki-builder
 
-ARG DEPLOY_ID
+ARG SLOT_ID
 ENV INITRAMFS=/work/initramfs
 ENV APPLETS="sh mount cat mkdir ls echo sleep switch_root insmod cp findfs"
 ENV ESSENTIAL="erofs overlay loop ext4 btrfs"
@@ -64,7 +64,7 @@ RUN KVER="$(cat /kver)"; \
     ukify build \
         --linux="/usr/lib/modules/$KVER/vmlinuz" \
         --initrd=/out/initramfs.img \
-        --cmdline "deploy=$DEPLOY_ID" \
+        --cmdline "slot=$SLOT_ID" \
         --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
         --output=/out/zerith.efi
 
@@ -79,7 +79,7 @@ RUN pacman -Syu --noconfirm \
     fuse-overlayfs \
     podman
 
-RUN echo 'root:root' | chpasswd #for debugging purposes 
+RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
