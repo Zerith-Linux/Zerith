@@ -73,6 +73,10 @@ jobs:
         run: |
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
+      - name: Generate deploy id
+        id: deploy_id
+        run: echo "id=${GITHUB_SHA:0:8}$(openssl rand -hex 4)" >> "$GITHUB_OUTPUT"
+
       - name: Generate image metadata
         id: metadata
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9
@@ -94,15 +98,9 @@ jobs:
             org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
             org.opencontainers.image.version={{date 'YYYYMMDD'}}
+            org.zerith.deploy-id=${{ steps.deploy_id.outputs.id }}
 
           sep-tags: " "
-
-      - name: Prepare build args
-        run: |
-          cat > build_args.txt <<EOF
-          IMAGE=${{ env.IMAGE_NAME }}
-          FLAVOR=${{ matrix.flavor }}
-          EOF
 
       - name: Build Image
         id: build_image
@@ -113,6 +111,8 @@ jobs:
           image: ${{ env.IMAGE_NAME }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            DEPLOY_ID=${{ steps.deploy_id.outputs.id }}
           oci: false
 
       - name: Post-process image
