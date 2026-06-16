@@ -1,76 +1,78 @@
 #!/bin/sh
-
+# Zerith initramfs init: bring up the composefs root with writable state, then
+# hand off to the real init. Any failure drops to a rescue shell.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs dev /dev
+die()   { echo "FATAL: $*"; exec sh; }
+retry() {                       # retry <tries> <cmd...> — returns 0 once cmd succeeds
+    tries="$1"; shift
+    while ! "$@"; do
+        tries=$((tries - 1))
+        [ "$tries" -le 0 ] && return 1
+        sleep 1
+    done
+}
+
+# --- API filesystems + console -------------------------------------------------
+mount -t proc     proc  /proc
+mount -t sysfs    sysfs /sys
+mount -t devtmpfs dev   /dev
 exec < /dev/console > /dev/console 2>&1
 
-# load modules (builtins/absent report "not found" — harmless; the guard below
-# is the real check). vmd is loaded BEFORE nvme so NVMe hidden behind Intel
-# VMD/RST is discovered. The rest cover NVMe/SATA/USB/eMMC on UEFI laptops+desktops.
+# --- storage + filesystem drivers ----------------------------------------------
+# vmd before nvme so an SSD behind Intel VMD/RST is found; the rest cover
+# NVMe/SATA/USB/eMMC. Builtin or absent modules report "not found" harmlessly.
 for m in virtio_pci virtio_blk vmd nvme ahci sd_mod \
          usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block \
          ext4 btrfs loop erofs overlay; do
     modprobe "$m" >/dev/null 2>&1
 done
 
-# composefs needs erofs + overlay registered and loop available before it can mount
+fs_ready() { grep -q "[[:space:]]$1\$" /proc/filesystems; }
 for fs in erofs overlay; do
-    i=0
-    until grep -q "[[:space:]]${fs}\$" /proc/filesystems; do
-        i=$((i+1)); [ "$i" -ge 5 ] && { echo "FATAL: $fs never registered"; exec sh; }
-        sleep 1
-    done
+    retry 5 fs_ready "$fs" || die "$fs never registered"
 done
-[ -e /dev/loop-control ] || { echo "FATAL: loop not available"; exec sh; }
+[ -e /dev/loop-control ] || die "loop not available"
 
+# --- pick slot, locate the boot device -----------------------------------------
 slot=a
 BOOTDEV="LABEL=zerith"
 for arg in $(cat /proc/cmdline); do
     case "$arg" in slot=*) slot="${arg#slot=}" ;; esac
 done
 
-DEV=""
-n=0
-while [ "$n" -lt 20 ]; do
-    DEV="$(findfs "$BOOTDEV" 2>/dev/null)"
-    [ -b "$DEV" ] && break
-    sleep 1; n=$((n+1))
-done
-[ -b "$DEV" ] || { echo "FATAL: $BOOTDEV not found"; exec sh; }
+resolve_dev() { DEV="$(findfs "$BOOTDEV" 2>/dev/null)"; [ -b "$DEV" ]; }
+retry 20 resolve_dev || die "$BOOTDEV not found"
 
 mkdir -p /mnt /sysroot
-mount "$DEV" /mnt || { echo "mount $DEV failed"; exec sh; }
-
+mount "$DEV" /mnt || die "mount $DEV failed"
 BASE="/mnt/deploy/$slot"
 
-# composefs needs a real, initialized loop device to mount the EROFS image, and
-# there's no udev here to create one — prime one the way busybox does.
+# --- composefs root ------------------------------------------------------------
+# composefs needs a real loop device and there's no udev here to make one;
+# priming an erofs loop mount first gets the kernel to set one up.
 mkdir -p /tmp/prime
 mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
+mount.composefs "$BASE/root.cfs" /sysroot -o basedir=/mnt/deploy/shared/objects \
+    || die "composefs mount failed"
 
-/sbin/mount.composefs "$BASE/root.cfs" /sysroot \
-    -o basedir=/mnt/deploy/shared/objects \
-    || { echo "composefs mount failed"; exec sh; }
+# --- writable state (mount /var before the /etc overlay) -----------------------
+mount -t btrfs -o subvol=@var  "$DEV" /sysroot/var  || die "var mount failed"
+mount -t btrfs -o subvol=@home "$DEV" /sysroot/home || die "home mount failed"
 
-# writable state over the read-only root (must mount /var BEFORE the /etc overlay)
-mount -t btrfs -o subvol=@var  "$DEV" /sysroot/var  || { echo "var mount failed";  exec sh; }
-mount -t btrfs -o subvol=@home "$DEV" /sysroot/home || { echo "home mount failed"; exec sh; }
-
-# first boot / after factory reset: empty @var -> seed it from the read-only factory copy
+# first boot / factory reset: seed an empty @var from the read-only factory copy
 if [ -z "$(ls -A /sysroot/var 2>/dev/null)" ]; then
     echo "seeding /var from factory"
     cp -a /sysroot/usr/share/factory/var/. /sysroot/var/
 fi
 
-# /etc overlay — upper/work live on persistent @var, so /etc survives cascade updates
+# /etc overlay: upper/work live on @var so edits survive cascade updates
 mkdir -p /sysroot/var/lib/etc/upper /sysroot/var/lib/etc/work
 mount -t overlay overlay /sysroot/etc \
     -o lowerdir=/sysroot/usr/etc,upperdir=/sysroot/var/lib/etc/upper,workdir=/sysroot/var/lib/etc/work \
-    || { echo "etc overlay failed"; exec sh; }
+    || die "etc overlay failed"
 
+# --- hand off ------------------------------------------------------------------
 mount -o bind /dev /sysroot/dev
 mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /sysroot/run
 exec switch_root /sysroot /sbin/init

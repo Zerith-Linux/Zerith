@@ -1,84 +1,68 @@
 FROM docker.io/archlinux:base AS uki-builder
+
+ENV INITRAMFS=/work/initramfs
+ENV APPLETS="sh mount cat mkdir ls echo sleep switch_root insmod cp findfs"
+ENV ESSENTIAL="erofs overlay loop ext4 btrfs"
+ENV HW="virtio_pci virtio_blk vmd nvme ahci sd_mod usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block"
+
 COPY init /init
 RUN chmod +x /init
 
 RUN pacman -Syu --noconfirm \
-    linux binutils util-linux busybox cpio systemd systemd-ukify composefs kmod zstd
+        linux binutils util-linux busybox cpio systemd systemd-ukify composefs kmod zstd
 
-RUN mkdir -p /work/initramfs/{bin,sbin,dev,proc,sys,mnt,sysroot,run} /out && \
-    ln -s usr/lib /work/initramfs/lib && \
-    ln -s usr/lib /work/initramfs/lib64 && \
-    mkdir -p /work/initramfs/usr/lib
+RUN ls /usr/lib/modules | grep -v '^extramodules' | head -n1 > /kver
 
-# busybox + applets  (findfs added: resolve boot= by LABEL/UUID on real hardware)
-RUN cp /usr/bin/busybox /work/initramfs/bin/ && \
-    for a in sh mount cat mkdir ls echo sleep switch_root insmod cp findfs; do \
-        ln -sf busybox /work/initramfs/bin/$a; \
+RUN mkdir -p "$INITRAMFS"/{bin,sbin,dev,proc,sys,mnt,sysroot,run} "$INITRAMFS/usr/lib" /out && \
+    ln -s usr/lib "$INITRAMFS/lib" && \
+    ln -s usr/lib "$INITRAMFS/lib64"
+
+RUN cp /usr/bin/busybox "$INITRAMFS/bin/" && \
+    for a in $APPLETS; do ln -sf busybox "$INITRAMFS/bin/$a"; done
+
+RUN cp "$(command -v modprobe)" "$INITRAMFS/sbin/modprobe" && \
+    cp "$(command -v mount.composefs || echo /usr/sbin/mount.composefs)" "$INITRAMFS/sbin/mount.composefs"
+
+RUN for b in "$INITRAMFS"/bin/busybox "$INITRAMFS"/sbin/modprobe "$INITRAMFS"/sbin/mount.composefs; do \
+        ldd "$b" 2>/dev/null | awk '/=>/{print $3} /ld-linux/{print $1}'; \
+    done | sort -u | while read -r lib; do \
+        [ -f "$lib" ] || continue; \
+        mkdir -p "$INITRAMFS$(dirname "$lib")" && cp -Lu "$lib" "$INITRAMFS$lib"; \
     done
 
-# modprobe + mount.composefs
-RUN cp "$(command -v modprobe)" /work/initramfs/sbin/modprobe && \
-    MC="$(command -v mount.composefs || echo /usr/sbin/mount.composefs)" && \
-    cp "$MC" /work/initramfs/sbin/mount.composefs
-
-# shared libs for every dynamic binary we added
-RUN for b in /work/initramfs/bin/busybox \
-             /work/initramfs/sbin/modprobe \
-             /work/initramfs/sbin/mount.composefs; do \
-        for l in $(ldd "$b" 2>/dev/null | awk '/=>/{print $3} /ld-linux/{print $1}'); do \
-            [ -f "$l" ] || continue; \
-            mkdir -p "/work/initramfs$(dirname "$l")"; \
-            cp -Lu "$l" "/work/initramfs$l"; \
-        done; \
-    done
-
-# modules + dependency closure, shipped UNCOMPRESSED.
-RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
-    mkdir -p "/work/initramfs/usr/lib/modules/$KVER" && \
+RUN KVER="$(cat /kver)"; MODDIR="$INITRAMFS/usr/lib/modules/$KVER"; \
+    mkdir -p "$MODDIR" && \
     for f in modules.builtin modules.builtin.modinfo modules.order; do \
-        cp "/usr/lib/modules/$KVER/$f" "/work/initramfs/usr/lib/modules/$KVER/"; \
+        cp "/usr/lib/modules/$KVER/$f" "$MODDIR/"; \
     done && \
-    ESSENTIAL="erofs overlay loop ext4 btrfs" && \
-    HW="virtio_pci virtio_blk vmd nvme ahci sd_mod usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block" && \
-    for m in $ESSENTIAL $HW; do \
-        modprobe -S "$KVER" -D "$m" 2>/dev/null; \
-    done | awk '/^insmod/{print $2}' | sort -u | while read ko; do \
-        rel="${ko##*/modules/$KVER/}"; \
-        dst="/work/initramfs/usr/lib/modules/$KVER/$rel"; \
-        mkdir -p "$(dirname "$dst")"; cp "$ko" "$dst"; \
-    done && \
-    find "/work/initramfs/usr/lib/modules/$KVER" -name '*.ko.zst' -exec zstd -d --rm {} \; && \
-    depmod -b /work/initramfs "$KVER"
+    for m in $ESSENTIAL $HW; do modprobe -S "$KVER" -D "$m" 2>/dev/null; done \
+        | awk '/^insmod/{print $2}' | sort -u | while read -r ko; do \
+            dst="$MODDIR/${ko##*/modules/$KVER/}"; \
+            mkdir -p "$(dirname "$dst")" && cp "$ko" "$dst"; \
+        done && \
+    find "$MODDIR" -name '*.ko.zst' -exec zstd -d --rm {} \; && \
+    depmod -b "$INITRAMFS" "$KVER"
 
-# sanity check: essentials are fatal-if-missing; hw drivers only warn if absent
-RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
-    MODROOT="/work/initramfs/usr/lib/modules/$KVER" && \
-    BUILTIN="/usr/lib/modules/$KVER/modules.builtin" && \
-    for m in erofs overlay loop btrfs; do \
-        if grep -qE "(^|/)${m}\.ko" "$BUILTIN" || find "$MODROOT" -name "${m}.ko*" | grep -q .; then \
-            echo "ok (essential): $m"; \
-        else \
-            echo "FATAL: essential module '$m' is neither builtin nor copied" >&2; exit 1; \
-        fi; \
-    done && \
-    for m in virtio_pci virtio_blk vmd nvme ahci sd_mod usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block; do \
-        if grep -qE "(^|/)${m}\.ko" "$BUILTIN" || find "$MODROOT" -name "${m}.ko*" | grep -q .; then \
-            echo "ok (hw):        $m"; \
-        else \
-            echo "note: hw driver '$m' unavailable on this kernel (skipped)"; \
-        fi; \
+RUN KVER="$(cat /kver)"; MODDIR="$INITRAMFS/usr/lib/modules/$KVER"; \
+    BUILTIN="/usr/lib/modules/$KVER/modules.builtin"; \
+    present() { grep -qE "(^|/)$1\.ko" "$BUILTIN" || find "$MODDIR" -name "$1.ko*" | grep -q .; }; \
+    for m in $ESSENTIAL; do \
+        present "$m" && echo "ok essential: $m" || { echo "FATAL: essential '$m' missing" >&2; exit 1; }; \
+    done; \
+    for m in $HW; do \
+        present "$m" && echo "ok hw:        $m" || echo "note: hw '$m' unavailable (skipped)"; \
     done
 
-RUN cp /init /work/initramfs/init && chmod +x /work/initramfs/init && \
-    cd /work/initramfs && \
+RUN cp /init "$INITRAMFS/init" && chmod +x "$INITRAMFS/init" && \
+    cd "$INITRAMFS" && \
     find . -print0 | cpio --null -ov --format=newc | gzip -9 > /out/initramfs.img
 
-RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
+RUN KVER="$(cat /kver)"; \
     ukify build \
-      --linux="/usr/lib/modules/$KVER/vmlinuz" \
-      --initrd=/out/initramfs.img \
-      --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
-      --output=/out/zerith.efi
+        --linux="/usr/lib/modules/$KVER/vmlinuz" \
+        --initrd=/out/initramfs.img \
+        --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
+        --output=/out/zerith.efi
 
 FROM docker.io/artixlinux/artixlinux:base-dinit
 COPY --from=uki-builder /out/zerith.efi /usr/lib/uki/zerith.efi
