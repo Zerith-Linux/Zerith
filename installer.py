@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import re
 from typing import NoReturn
 from datetime import datetime, timezone
 from pathlib import Path
@@ -284,6 +285,54 @@ def write_limine(efi: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Limine installation
+# --------------------------------------------------------------------------- #
+
+def install_limine(efi: Path, disk: Path, esp_part: str) -> None:
+    """Copy Limine EFI loader to ESP and create UEFI boot entry."""
+    if DRY_RUN:
+        log("[dry-run] install Limine")
+        return
+
+    limine_src = "/usr/share/limine/BOOTX64.EFI"
+    if not os.path.isfile(limine_src):
+        log("warning: Limine EFI loader not found at %s, skipping" % limine_src)
+        return
+
+    # Destination: /EFI/zerith-limine/BOOTX64.EFI
+    dest_dir = efi / "EFI" / "zerith-limine"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(limine_src, dest_dir / "BOOTX64.EFI")
+    vlog(f"copied Limine loader to {dest_dir / 'BOOTX64.EFI'}")
+
+    # Prepare efibootmgr command
+    m = re.search(r'p?(\d+)$', esp_part)
+    if not m:
+        log("warning: could not parse partition number from %s, skipping efibootmgr" % esp_part)
+        return
+    part_num = m.group(1)
+
+    if not shutil.which("efibootmgr"):
+        log("warning: efibootmgr not found, skipping boot entry creation")
+        return
+    if not os.path.exists("/sys/firmware/efi/efivars"):
+        log("warning: efivars not mounted, skipping boot entry creation")
+        return
+
+    cmd = [
+        "efibootmgr",
+        "--create",
+        "--disk", str(disk),
+        "--part", part_num,
+        "--label", "Zerith Boot Manager",
+        "--loader", r"\EFI\zerith-limine\BOOTX64.EFI",
+        "--unicode"
+    ]
+    run(cmd)
+    log("Limine boot entry created")
+
+
+# --------------------------------------------------------------------------- #
 # Deploy
 # --------------------------------------------------------------------------- #
 
@@ -371,6 +420,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--uki-in-image", default=DEFAULT_UKI_IN_IMAGE,
                    help="UKI path inside the image (with --image)")
 
+    p.add_argument("--no-limine", action="store_true",
+                   help="skip installing the Limine bootloader (efibootmgr)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true")
 
@@ -398,6 +449,9 @@ def main(argv: list[str] | None = None) -> int:
         esp_part, btrfs_part = partition_disk(
             args.disk, args.esp_size, args.label)
         sysroot, efi, unmount = mount_targets(esp_part, btrfs_part)
+        # Install Limine after mounting
+        if not args.no_limine:
+            install_limine(efi, args.disk, esp_part)
     else:
         sysroot, efi, unmount = args.sysroot, args.efi, (lambda: None)
 
