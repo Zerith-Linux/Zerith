@@ -10,9 +10,9 @@ RUN mkdir -p /work/initramfs/{bin,sbin,dev,proc,sys,mnt,sysroot,run} /out && \
     ln -s usr/lib /work/initramfs/lib64 && \
     mkdir -p /work/initramfs/usr/lib
 
-# busybox + applets
+# busybox + applets  (findfs added: resolve boot= by LABEL/UUID on real hardware)
 RUN cp /usr/bin/busybox /work/initramfs/bin/ && \
-    for a in sh mount cat mkdir ls echo sleep switch_root insmod cp; do \
+    for a in sh mount cat mkdir ls echo sleep switch_root insmod cp findfs; do \
         ln -sf busybox /work/initramfs/bin/$a; \
     done
 
@@ -32,13 +32,15 @@ RUN for b in /work/initramfs/bin/busybox \
         done; \
     done
 
-# only the modules we need, with their dependency closure (shipped UNCOMPRESSED)
+# modules + dependency closure, shipped UNCOMPRESSED.
 RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
     mkdir -p "/work/initramfs/usr/lib/modules/$KVER" && \
     for f in modules.builtin modules.builtin.modinfo modules.order; do \
         cp "/usr/lib/modules/$KVER/$f" "/work/initramfs/usr/lib/modules/$KVER/"; \
     done && \
-    for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do \
+    ESSENTIAL="erofs overlay loop ext4 btrfs" && \
+    HW="virtio_pci virtio_blk vmd nvme ahci sd_mod usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block" && \
+    for m in $ESSENTIAL $HW; do \
         modprobe -S "$KVER" -D "$m" 2>/dev/null; \
     done | awk '/^insmod/{print $2}' | sort -u | while read ko; do \
         rel="${ko##*/modules/$KVER/}"; \
@@ -48,16 +50,22 @@ RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
     find "/work/initramfs/usr/lib/modules/$KVER" -name '*.ko.zst' -exec zstd -d --rm {} \; && \
     depmod -b /work/initramfs "$KVER"
 
-# sanity check: every required module must be builtin or present in the initramfs
+# sanity check: essentials are fatal-if-missing; hw drivers only warn if absent
 RUN KVER="$(ls /usr/lib/modules | grep -v '^extramodules' | head -n1)" && \
-    for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do \
-        if grep -qE "(^|/)${m}\.ko" "/usr/lib/modules/$KVER/modules.builtin"; then \
-            echo "ok (builtin): $m"; \
-        elif find "/work/initramfs/usr/lib/modules/$KVER" -name "${m}.ko*" | grep -q .; then \
-            echo "ok (module):  $m"; \
+    MODROOT="/work/initramfs/usr/lib/modules/$KVER" && \
+    BUILTIN="/usr/lib/modules/$KVER/modules.builtin" && \
+    for m in erofs overlay loop btrfs; do \
+        if grep -qE "(^|/)${m}\.ko" "$BUILTIN" || find "$MODROOT" -name "${m}.ko*" | grep -q .; then \
+            echo "ok (essential): $m"; \
         else \
-            echo "FATAL: '$m' is neither builtin nor copied into the initramfs" >&2; \
-            exit 1; \
+            echo "FATAL: essential module '$m' is neither builtin nor copied" >&2; exit 1; \
+        fi; \
+    done && \
+    for m in virtio_pci virtio_blk vmd nvme ahci sd_mod usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block; do \
+        if grep -qE "(^|/)${m}\.ko" "$BUILTIN" || find "$MODROOT" -name "${m}.ko*" | grep -q .; then \
+            echo "ok (hw):        $m"; \
+        else \
+            echo "note: hw driver '$m' unavailable on this kernel (skipped)"; \
         fi; \
     done
 

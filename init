@@ -1,4 +1,5 @@
 #!/bin/sh
+
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
 mount -t proc proc /proc
@@ -6,8 +7,12 @@ mount -t sysfs sysfs /sys
 mount -t devtmpfs dev /dev
 exec < /dev/console > /dev/console 2>&1
 
-# load modules (builtins report "not found" — harmless; the guard below is the real check)
-for m in virtio_pci virtio_blk ext4 btrfs loop erofs overlay; do
+# load modules (builtins/absent report "not found" — harmless; the guard below
+# is the real check). vmd is loaded BEFORE nvme so NVMe hidden behind Intel
+# VMD/RST is discovered. The rest cover NVMe/SATA/USB/eMMC on UEFI laptops+desktops.
+for m in virtio_pci virtio_blk vmd nvme ahci sd_mod \
+         usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block \
+         ext4 btrfs loop erofs overlay; do
     modprobe "$m" >/dev/null 2>&1
 done
 
@@ -31,11 +36,24 @@ for arg in $(cat /proc/cmdline); do
 done
 [ -n "$BOOTDEV" ] || { echo "Missing boot="; exec sh; }
 
+# Resolve boot= and wait for it to enumerate. Accepts a /dev path OR a stable
+# identifier (LABEL=/UUID=/PARTLABEL=/PARTUUID=) — device names like nvme0n1p2
+# vs sda2 are NOT stable across machines, so use boot=LABEL=zerith in the cmdline.
+# NVMe/USB enumerate asynchronously, so we poll until the device appears.
+DEV=""
 n=0
-while [ ! -b "$BOOTDEV" ] && [ "$n" -lt 10 ]; do sleep 1; n=$((n+1)); done
+while [ "$n" -lt 20 ]; do
+    case "$BOOTDEV" in
+        LABEL=*|UUID=*|PARTLABEL=*|PARTUUID=*) DEV="$(findfs "$BOOTDEV" 2>/dev/null)" ;;
+        *) DEV="$BOOTDEV" ;;
+    esac
+    [ -n "$DEV" ] && [ -b "$DEV" ] && break
+    sleep 1; n=$((n+1))
+done
+[ -b "$DEV" ] || { echo "FATAL: boot device $BOOTDEV not found"; exec sh; }
 
 mkdir -p /mnt /sysroot
-mount "$BOOTDEV" /mnt || { echo "mount $BOOTDEV failed"; exec sh; }
+mount "$DEV" /mnt || { echo "mount $DEV failed"; exec sh; }
 
 BASE="/mnt/deploy/$slot"
 
@@ -49,8 +67,8 @@ mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
     || { echo "composefs mount failed"; exec sh; }
 
 # writable state over the read-only root (must mount /var BEFORE the /etc overlay)
-mount -t btrfs -o subvol=@var  "$BOOTDEV" /sysroot/var  || { echo "var mount failed";  exec sh; }
-mount -t btrfs -o subvol=@home "$BOOTDEV" /sysroot/home || { echo "home mount failed"; exec sh; }
+mount -t btrfs -o subvol=@var  "$DEV" /sysroot/var  || { echo "var mount failed";  exec sh; }
+mount -t btrfs -o subvol=@home "$DEV" /sysroot/home || { echo "home mount failed"; exec sh; }
 
 # first boot / after factory reset: empty @var -> seed it from the read-only factory copy
 if [ -z "$(ls -A /sysroot/var 2>/dev/null)" ]; then
