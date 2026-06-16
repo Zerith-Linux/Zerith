@@ -58,11 +58,12 @@ if [ -z "$(ls -A /sysroot/var 2>/dev/null)" ]; then
     cp -a /sysroot/usr/share/factory/var/. /sysroot/var/
 fi
 
-# /etc overlay — upper/work live on persistent @var, so /etc survives A/B updates
+# /etc overlay — upper/work live on persistent @var, so /etc survives cascade updates
 mkdir -p /sysroot/var/lib/etc/upper /sysroot/var/lib/etc/work
 mount -t overlay overlay /sysroot/etc \
     -o lowerdir=/sysroot/usr/etc,upperdir=/sysroot/var/lib/etc/upper,workdir=/sysroot/var/lib/etc/work \
     || { echo "etc overlay failed"; exec sh; }
 
 mount -o bind /dev /sysroot/dev
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /sysroot/run
 exec switch_root /sysroot /sbin/init

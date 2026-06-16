@@ -1,13 +1,13 @@
 # Zerith OS
 
-Zerith is a next-generation, immutable Linux distribution designed for robustness, security, and atomic updates. It leverages modern storage technologies like **composefs** and **EROFS** to provide a strictly read-only root filesystem with efficient deduplication and cryptographic verification.
+Zerith is a next-generation, immutable Linux distribution designed for robustness, security, and atomic updates. It is a **curated and opinionated experience**, providing a fully set up, modern, UEFI-only environment out of the box.
 
-The goal of Zerith is to provide a curated and opinionated experience that is fully set up and ready to go. It is a modern, UEFI-only distribution.
+Zerith leverages modern storage technologies like **composefs** and **EROFS** to provide a strictly read-only root filesystem with efficient deduplication and cryptographic verification.
 
 ## Core Architecture
 
 - **Immutable Core:** The root filesystem is mounted as a read-only `composefs` volume. This ensures the system remains in a known-good state and is protected against accidental or malicious modification.
-- **Linear Cascade Deployment:** Zerith uses a Linear Cascade model with an N-1 fallback state. New system images are always staged to slot `a`. Before a new image is staged, the previous content of slot `a` is cascaded to slot `b`, ensuring that slot `b` always contains a reliable N-1 fallback of the previous known-good state. Updates are delivered as signed filesystem images that are swapped atomically on the next boot.
+- **Linear Cascade Deployment:** Unlike traditional A/B models that toggle between two slots, Zerith employs a Linear Cascade model with an N-1 fallback state. New system images are always staged to slot `a`. Before a new image is staged, the previous content of slot `a` is cascaded to slot `b`, ensuring that slot `b` always contains a reliable N-1 fallback (the previous known-good state). Updates are delivered as signed filesystem images that are applied atomically.
 - **Deduplication with composefs:** By using `composefs`, multiple versions of the OS (or multiple containers) can share the same underlying data blocks in a shared object store, significantly reducing disk usage.
 - **Systemd-free (Artix-based):** Zerith is built on the Artix Linux base using **dinit** as the service manager, providing a fast and lightweight init system without the complexity of systemd.
 - **State Management:**
@@ -26,11 +26,11 @@ The goal of Zerith is to provide a curated and opinionated experience that is fu
 
 ## Getting Started
 
-*(Instructions for building or installing Zerith would go here as the project matures.)*
+Zerith is currently in active development. We are working on providing official build scripts and installation media. In the meantime, you can explore the system architecture through the `Containerfile` and `init` script.
 
 ## Development
 
-The project is currently in early development. The build process is containerized via the `Containerfile`, which generates the UKI and prepares the filesystem structure.
+The project is currently in early development. The build process is containerized via the `Containerfile`, which generates the Unified Kernel Image (UKI) and prepares the initial filesystem structure.
 
 ### Build Requirements
 - `podman` or `docker`
