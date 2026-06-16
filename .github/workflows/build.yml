@@ -133,6 +133,7 @@ jobs:
             rm -rf "$mnt/root" "$mnt/srv"
             ln -s var/roothome "$mnt/root"
             ln -s var/srv      "$mnt/srv"
+            mkdir "$mnt/var/roothome" "$mnt/var/srv"
 
             buildah unmount "$ctr"
             buildah commit "$ctr" post-processed
