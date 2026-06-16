@@ -75,6 +75,8 @@ RUN pacman -Syu --noconfirm \
     fuse-overlayfs \
     podman
 
+RUN echo 'root:root' | chpasswd #for debugging purposes 
+
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
 
