@@ -27,7 +27,7 @@ done
 [ -e /dev/loop-control ] || { echo "FATAL: loop not available"; exec sh; }
 
 slot=a
-BOOTDEV="LABEL=zena"
+BOOTDEV="LABEL=zerith"
 for arg in $(cat /proc/cmdline); do
     case "$arg" in slot=*) slot="${arg#slot=}" ;; esac
 done
