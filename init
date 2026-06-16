@@ -27,30 +27,19 @@ done
 [ -e /dev/loop-control ] || { echo "FATAL: loop not available"; exec sh; }
 
 slot=a
-BOOTDEV=""
+BOOTDEV="LABEL=zena"
 for arg in $(cat /proc/cmdline); do
-    case "$arg" in
-        slot=*) slot="${arg#slot=}" ;;
-        boot=*) BOOTDEV="${arg#boot=}" ;;
-    esac
+    case "$arg" in slot=*) slot="${arg#slot=}" ;; esac
 done
-[ -n "$BOOTDEV" ] || { echo "Missing boot="; exec sh; }
 
-# Resolve boot= and wait for it to enumerate. Accepts a /dev path OR a stable
-# identifier (LABEL=/UUID=/PARTLABEL=/PARTUUID=) — device names like nvme0n1p2
-# vs sda2 are NOT stable across machines, so use boot=LABEL=zerith in the cmdline.
-# NVMe/USB enumerate asynchronously, so we poll until the device appears.
 DEV=""
 n=0
 while [ "$n" -lt 20 ]; do
-    case "$BOOTDEV" in
-        LABEL=*|UUID=*|PARTLABEL=*|PARTUUID=*) DEV="$(findfs "$BOOTDEV" 2>/dev/null)" ;;
-        *) DEV="$BOOTDEV" ;;
-    esac
-    [ -n "$DEV" ] && [ -b "$DEV" ] && break
+    DEV="$(findfs "$BOOTDEV" 2>/dev/null)"
+    [ -b "$DEV" ] && break
     sleep 1; n=$((n+1))
 done
-[ -b "$DEV" ] || { echo "FATAL: boot device $BOOTDEV not found"; exec sh; }
+[ -b "$DEV" ] || { echo "FATAL: $BOOTDEV not found"; exec sh; }
 
 mkdir -p /mnt /sysroot
 mount "$DEV" /mnt || { echo "mount $DEV failed"; exec sh; }
