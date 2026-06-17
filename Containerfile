@@ -78,6 +78,7 @@ COPY zerith-ctl /usr/local/bin/zerith-ctl
 # Base Packages
 RUN pacman -Syu --noconfirm \
     base \
+    btop \
     limine \
     util-linux \
     dinit \
