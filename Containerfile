@@ -5,7 +5,7 @@ FROM docker.io/archlinux:base AS uki-builder
 ARG DEPLOY_ID
 ENV INITRAMFS=/work/initramfs
 ENV APPLETS="sh mount cat mkdir ls echo sleep switch_root insmod cp findfs"
-ENV ESSENTIAL="erofs overlay loop ext4 btrfs"
+ENV ESSENTIAL="erofs overlay loop fat vfat ext4 btrfs"
 ENV HW="virtio_pci virtio_blk vmd nvme ahci sd_mod usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block"
 
 COPY init /init

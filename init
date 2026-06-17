@@ -24,7 +24,7 @@ exec < /dev/console > /dev/console 2>&1
 # NVMe/SATA/USB/eMMC. Builtin or absent modules report "not found" harmlessly.
 for m in virtio_pci virtio_blk vmd nvme ahci sd_mod \
          usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block \
-         ext4 btrfs loop erofs overlay; do
+         fat vfat ext4 btrfs loop erofs overlay; do
     modprobe "$m" >/dev/null 2>&1
 done
 
