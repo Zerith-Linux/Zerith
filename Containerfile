@@ -78,6 +78,7 @@ COPY zerith-ctl /usr/local/bin/zerith-ctl
 # Base Packages
 RUN pacman -Syu --noconfirm \
     base \
+    base-devel \
     btop \
     limine \
     util-linux \
@@ -89,6 +90,8 @@ RUN pacman -Syu --noconfirm \
     e2fsprogs \
     dosfstools \
     efibootmgr \
+    git \
+    greetd-dinit \
     sudo \
     shadow \
     iproute2 \
@@ -118,6 +121,15 @@ RUN pacman -Syu --noconfirm \
     kmod \
     ca-certificates
 
+RUN useradd -m -G wheel aur && \
+    echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
+    su aur -c "cd /home/aur && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm" && \
+    su aur -c "yay -S --noconfirm mangowm noctalia-git noctalia-greeter-git" && \
+    pacman -Rs --noconfirm base-devel && \
+    pacman -Scc --noconfirm && \
+    userdel -r aur && \
+    sed -i '/aur ALL=(ALL) NOPASSWD: ALL/d' /etc/sudoers
+
 RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN dinitctl -o enable NetworkManager
@@ -127,3 +139,5 @@ RUN mkdir -p /usr/etc/dinit.d && \
 
 RUN mkdir -p /usr/lib/tmpfiles.d && \
     printf 'd /var/log/dinit 0755 root root -\n' > /usr/lib/tmpfiles.d/zerith-dinit.conf
+
+RUN rm -rf /usr/lib/systemd /etc/systemd /var/lib/systemd
