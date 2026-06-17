@@ -4,6 +4,10 @@ An immutable, image-based Linux distribution built on Artix, with a
 composefs read-only root, role-based deployments with an N-1 fallback,
 and a true factory-reset model.
 
+**No Bootc here ;P**
+
+But Zerith is definitely inspired from bootc
+
 ---
 
 ## What is Zerith?
