@@ -86,6 +86,7 @@ jobs:
           tags: |
             type=raw,value=${{ env.TAG_PREFIX }}{{date 'YYYYMMDD'}}
             type=raw,value=${{ env.TAG_PREFIX }}${{ env.DEFAULT_TAG }}
+            type=raw,value=${{ env.TAG_PREFIX }}${{ steps.deploy_id.outputs.id }}
             type=sha,enable=${{ github.event_name == 'pull_request' }}
             type=ref,event=pr
 
