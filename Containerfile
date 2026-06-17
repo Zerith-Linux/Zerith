@@ -79,50 +79,51 @@ COPY zerith-ctl /usr/local/bin/zerith-ctl
 RUN pacman -Syu --noconfirm \
     base \
     base-devel \
-    btop \
-    limine \
+    ca-certificates \
     util-linux \
+    which \
     dinit \
-    composefs \
-    fuse-overlayfs \
-    podman \
-    btrfs-progs \
-    e2fsprogs \
-    dosfstools \
-    efibootmgr \
-    git \
+    dbus \
+    dbus-dinit \
     greetd \
     greetd-dinit \
-    sudo \
-    seatd \
-    seatd-dinit \
+    networkmanager-dinit \
     shadow \
+    sudo \
+    curl \
+    dhcpcd \
     iproute2 \
     iputils \
-    dhcpcd \
-    curl \
-    wget \
-    less \
-    nano \
     networkmanager \
-    networkmanager-dinit \
-    vim \
-    tar \
-    gzip \
-    xz \
-    zstd \
-    unzip \
-    rsync \
-    which \
-    grep \
-    sed \
-    gawk \
-    findutils \
-    procps-ng \
+    wget \
+    polkit \
+    btrfs-progs \
+    composefs \
+    dosfstools \
+    e2fsprogs \
+    fuse-overlayfs \
+    efibootmgr \
+    limine \
+    podman \
+    kmod \
     pciutils \
     usbutils \
-    kmod \
-    ca-certificates
+    findutils \
+    gawk \
+    grep \
+    procps-ng \
+    sed \
+    gzip \
+    rsync \
+    tar \
+    unzip \
+    xz \
+    zstd \
+    git \
+    less \
+    nano \
+    vim \
+    btop
 
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
@@ -136,7 +137,7 @@ RUN useradd -m -G wheel aur && \
 RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN dinitctl -o enable NetworkManager && \
-    dinitctl -o enable seatd && \
+    dinitctl -o enable dbus && \
     dinitctl -o disable getty1
 
 RUN mkdir -p /usr/etc/dinit.d && \
