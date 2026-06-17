@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-
 Operates on a running Zerith host (the @deploy subvolume mounted at /deploy and
 the ESP mounted at /efi):
 
@@ -30,20 +29,24 @@ you switch tag or repo, e.g. `deploy ghcr.io/zerith-linux/zerith-nvidia:latest`.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NoReturn
+from typing import Generator, NoReturn
 
 DEFAULT_DEPLOY = Path("/deploy")
 DEFAULT_ESP = Path("/efi")
 DEFAULT_UKI_IN_IMAGE = "usr/lib/uki/zerith.efi"   # matches the Containerfile
 # update channel, lives in @deploy
 SOURCE_CONF_NAME = "source.conf"
+LOCK_NAME = ".zerith-ctl.lock"   # serializes mutating ops within @deploy
 CONFIG_SCHEMA = 1
 META_SCHEMA = 1
 ROLES = ("current", "fallback", "staging")
@@ -91,6 +94,25 @@ def now() -> str:
 def require_root() -> None:
     if not DRY_RUN and os.geteuid() != 0:
         die("must run as root")
+
+
+@contextmanager
+def deploy_lock(deploy: Path) -> "Generator[None, None, None]":
+    if DRY_RUN:
+        yield
+        return
+    lock_path = deploy / LOCK_NAME
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("another zerith-ctl holds the lock; waiting…")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +275,53 @@ def source_from_image(image: str, uki_in_image: str) -> Source:
 # Stage / promote / rollback / gc
 # --------------------------------------------------------------------------- #
 
+# composefs stores each file's content under objects/<first 2 hex>/<rest>, named
+# by its fs-verity (sha256) digest. `composefs-info dump` prints that digest for
+# every regular file, so it tells us exactly which objects an image references.
+_DIGEST_RE = re.compile(r"\b[0-9a-f]{64}\b")
+
+
+def referenced_objects(root_cfs: Path) -> set[str]:
+    """Object store paths ("ab/cdef…") referenced by a single composefs image.
+
+    Reads `composefs-info dump` and pulls out the sha256 digests. The result is
+    the precise object set for ONE deployment — the thing the holder must mirror
+    so GC's link-count test stays honest.
+    """
+    dump = run(["composefs-info", "dump", str(root_cfs)], capture=True)
+    return {f"{d[:2]}/{d[2:]}" for d in _DIGEST_RE.findall(dump)}
+
+
+def link_holder(shared: Path, holder: Path, root_cfs: Path) -> None:
+    """Hardlink exactly this deployment's objects from the shared store into its
+    private holder dir, bumping each referenced object's link count by one.
+
+    This replaces the old `cp -a -l shared/. holder/`, which mirrored the WHOLE
+    shared store into every new holder. On the second deploy onward that pinned
+    objects belonging to other deployments, so GC could never drop them and the
+    store leaked space across updates. Here we link only what this image's
+    root.cfs actually points at.
+
+    Each candidate is validated against the shared store before linking, so a
+    stray match can at worst over-pin one object (harmless) — it can never cause
+    a live object to be freed.
+    """
+    holder.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for rel in referenced_objects(root_cfs):
+        src = shared / rel
+        if not src.is_file():
+            continue
+        dst = holder / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, dst)
+            linked += 1
+        except FileExistsError:
+            pass
+    vlog(f"holder: linked {linked} object(s) for this deployment")
+
+
 def stage(deploy: Path, src: Source) -> None:
     """Materialize a deployment on disk and mark it `staging`. Idempotent."""
     shared = deploy / "shared" / "objects"
@@ -276,14 +345,16 @@ def stage(deploy: Path, src: Source) -> None:
         run(["mkcomposefs", f"--digest-store={shared}",
              str(src.rootfs), str(root_cfs)])
 
-        # Per-deployment hardlink holder: every object now has one extra link.
-        # GC keys off that link count, so this is what keeps shared objects alive.
+        # Per-deployment hardlink holder: bump the link count of ONLY the
+        # objects this image references. GC keys off that count to know when an
+        # object has no remaining holders. (Linking the whole shared store here
+        # would pin other deployments' objects and leak space across updates.)
         if DRY_RUN:
             log(f"[dry-run] mkdir -p {holder}")
-            log(f"[dry-run] cp -a -l {shared}/. {holder}/")
+            log(f"[dry-run] hardlink this image's objects from {
+                shared} into {holder}")
         else:
-            holder.mkdir(parents=True, exist_ok=True)
-            run(["cp", "-a", "-l", f"{shared}/.", f"{holder}/"])
+            link_holder(shared, holder, root_cfs)
 
         if DRY_RUN:
             log(f"[dry-run] cp {src.uki} -> {btrfs_uki}")
@@ -382,7 +453,7 @@ def gc(deploy: Path) -> None:
     if DRY_RUN:
         log(f"[dry-run] sweep orphaned objects in {shared} (link count == 1)")
     elif shared.is_dir():
-        for root, _dirs, files in os.walk(shared):
+        for root, _, files in os.walk(shared):
             for name in files:
                 fp = Path(root) / name
                 try:
@@ -391,7 +462,7 @@ def gc(deploy: Path) -> None:
                         swept += 1
                 except OSError:
                     pass
-        for root, dirs, _files in os.walk(shared, topdown=False):
+        for root, dirs, _ in os.walk(shared, topdown=False):
             for d in dirs:
                 try:
                     (Path(root) / d).rmdir()       # prune now-empty dirs
@@ -410,7 +481,7 @@ def gc(deploy: Path) -> None:
 # Status
 # --------------------------------------------------------------------------- #
 
-def status(deploy: Path, esp: Path, config: Path) -> None:
+def status(deploy: Path, config: Path) -> None:
     print(f"channel   {read_source(config) or '(unset — run deploy IMAGE)'}")
     for role in ROLES:
         rid = read_role(deploy, role)
@@ -498,27 +569,30 @@ def main(argv: list[str] | None = None) -> int:
     config = args.config or (deploy / SOURCE_CONF_NAME)
 
     if args.cmd == "status":
-        status(deploy, esp, config)
+        status(deploy, config)
         return 0
 
     require_root()
     check_layout(deploy, esp)
 
-    if args.cmd == "gc":
-        gc(deploy)
-    elif args.cmd in ("rollback", "swap"):
-        rollback(deploy, esp)
-    elif args.cmd == "deploy":
-        do_deploy(deploy, esp, args.image, args.uki_in_image)
-        # deploy is the only thing that changes the channel
-        write_source(config, args.image)
-    elif args.cmd == "update":
-        image = read_source(config)
-        if not image:
-            die(f"no update channel configured in {
-                config}; run 'deploy IMAGE' first")
-        log(f"update: pulling configured channel {image}")
-        do_deploy(deploy, esp, image, args.uki_in_image)
+    # Serialize everything that mutates roles, the object store, or the channel,
+    # so a scheduled `update` can't race a hand-run `deploy`/`rollback`/`gc`.
+    with deploy_lock(deploy):
+        if args.cmd == "gc":
+            gc(deploy)
+        elif args.cmd in ("rollback", "swap"):
+            rollback(deploy, esp)
+        elif args.cmd == "deploy":
+            do_deploy(deploy, esp, args.image, args.uki_in_image)
+            # deploy is the only thing that changes the channel
+            write_source(config, args.image)
+        elif args.cmd == "update":
+            image = read_source(config)
+            if not image:
+                die(f"no update channel configured in {
+                    config}; run 'deploy IMAGE' first")
+            log(f"update: pulling configured channel {image}")
+            do_deploy(deploy, esp, image, args.uki_in_image)
 
     return 0
 

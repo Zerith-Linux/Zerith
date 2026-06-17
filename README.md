@@ -18,6 +18,41 @@ be rolled back to the previous known-good state.
 It is built from OCI container images, converted to composefs, packed into a
 Unified Kernel Image (UKI), and booted by Limine under UEFI.
 
+## Why Zerith?
+
+Zerith exists to answer one question: **what does a modern, image-based,
+atomically-updated Linux look like without systemd?**
+
+The immutable-OS idea — a read-only, versioned root you swap whole and roll
+back on failure — has been well proven by projects like Fedora Silverblue,
+bootc, and the Universal Blue family. But nearly all of them are built *on*
+systemd: systemd as PID 1, plus its surrounding stack (systemd-boot, journald,
+logind, systemd-sysupdate, ostree wired into systemd units). If you'd rather
+not run systemd, the immutable-OS design space is almost empty. Zerith is an
+experiment to fill that gap.
+
+- **No systemd in the running OS.** Init is **dinit**, on an Artix base — no
+  PID 1 systemd, no journald, no logind. (The one place systemd code appears is
+  the *build*: the UKI is assembled with `ukify` and systemd's EFI stub. Those
+  are build-time tools and never ship in the image you boot.)
+- **Keeps the good parts of immutable OSes.** Read-only composefs root, atomic
+  whole-image updates, an N-1 fallback to roll back to, content-addressed
+  dedup between deployments, and a true factory reset.
+- **Small and legible.** The whole system is a `Containerfile` plus three short
+  scripts — `init`, `install`, and `zerith-ctl`. You can read the entire boot
+  and update path in an afternoon; there's no large init system or update
+  daemon to reverse-engineer.
+- **Built like a container, not assembled on the box.** The OS is an OCI image
+  you can rebuild, inspect, and diff. Updates are image swaps, not in-place
+  package upgrades.
+
+It's also, frankly, a **learn-by-building project** — a way to understand how
+immutable boot, composefs, and UKIs actually fit together by wiring them up
+from scratch instead of inheriting a turnkey stack. If you want a battle-tested
+daily driver today, the systemd-based options above are far more mature. If you
+want a systemd-free take on the same ideas — or just to see how little code the
+core really needs — that's the point of Zerith.
+
 ## Design principles
 
 - **Immutable root** — `/usr` and the rest of `/` are read-only and
@@ -83,10 +118,15 @@ btrfs contents on `vda2`:
 
 ```
 @deploy                       # subvolume → /deploy
-  <id>/root.cfs               #   per-deployment composefs index (current = N)
+  current  ─▶ <id>            #   role symlinks (relative): the N (default-boot) image
+  fallback ─▶ <id>            #   previous known-good image (N-1)
+  staging  ─▶ <id>            #   transient, present only during an update
+  <id>/root.cfs               #   per-deployment composefs index
   <id>/zerith.efi             #   per-deployment UKI (source for the ESP copy)
+  <id>/objects/               #   per-deployment hardlink holder (object GC refcount)
+  <id>/deployment.json        #   self-describing metadata (id / version / image)
   shared/objects/             #   shared content-addressed object store
-  state.json                  #   deployment roles: current / fallback / staging
+  source.conf                 #   update channel (the image `update` pulls)
 @var                          # subvolume → /var   (persistent)
 @home                         # subvolume → /home  (persistent)
 ```
@@ -110,7 +150,11 @@ is left to the init system.
 
 Each system image is identified by its own **deploy id** (baked into its UKI as
 `deploy=<id>`) and lives in its own directory under `@deploy`. Which image plays
-which part is tracked in `state.json` by **role**, not by directory name:
+which part is tracked by three **relative symlinks** inside `@deploy` —
+`current`, `fallback`, and `staging` — by **role**, not by directory name. A
+role change is a single atomic `rename()`, and each deployment is fully
+self-describing via its own `deployment.json`, so there's no central index file
+to keep in sync:
 
 - **`current`** — the image booted by default (the `N` state).
 - **`fallback`** — the previous known-good image, kept for recovery (the `N-1`
@@ -138,9 +182,11 @@ If `current` fails to boot, selecting the previous Limine entry boots
 across deployments, promotion and demotion move only the small `root.cfs` index
 and any new objects, never whole filesystem copies.
 
-> The installer currently performs the **initial install** (one deployment as
-> `current`, with `state.json` seeded for the role model above). The full
-> promote/demote update flow is still in progress — see **Status**.
+> The `install` script performs the **initial install** (one deployment as
+> `current`, seeding `source.conf` with the update channel). From then on,
+> `zerith-ctl` drives the lifecycle on the running host — `deploy`, `update`,
+> `rollback`/`swap`, and `gc` — handling staging, promote/demote, and object
+> reclamation. See **Host tooling** and **Status**.
 
 ### Writable state and factory reset
 
@@ -181,11 +227,38 @@ Zerith images are produced from container images, not assembled on the target:
    the shared store, promote it to `current` (demoting the old current to
    `fallback`), and copy its UKI to `/zerith/current.efi` on the ESP.
 
+Steps 1–4 and 6 are the **image build** (the `Containerfile`, run in CI). Steps
+5 and 7 happen on the host at **install/update time** — `install` does them for
+the first deployment, and `zerith-ctl` for every one after.
+
+---
+
+## Host tooling
+
+`zerith-ctl` operates on a running host (the `@deploy` subvolume at `/deploy`
+and the ESP at `/efi`). Mutating commands take an exclusive lock on `@deploy`,
+so a scheduled `update` and a hand-run `deploy` can't race each other.
+
+| Command            | What it does                                                        |
+|--------------------|---------------------------------------------------------------------|
+| `status`           | show the update channel and the current / fallback / staging roles  |
+| `deploy IMAGE`     | set the update channel to `IMAGE`, pull it, and promote to current  |
+| `update`           | pull the configured channel image and promote it if it changed      |
+| `rollback` (`swap`)| swap current ⇄ fallback                                             |
+| `gc`               | drop unreferenced deployments and sweep orphaned objects            |
+
+Objects are deduplicated across deployments in `shared/objects`, and each
+deployment keeps a private hardlink "holder" of just the objects it references.
+GC reclaims an object once its link count shows no holder still needs it, so
+removing an old deployment frees only the files unique to it.
+
 ---
 
 ## Status
 
 Zerith is an in-development, experimental distribution. Expect rough edges
-around tooling and update orchestration. Core mechanics — composefs root,
-UKI/Limine boot, role-based deployments, writable subvolumes, and factory reset — are
-the working foundation.
+around tooling and packaging. The core mechanics — composefs root, UKI/Limine
+boot, role-based deployments with an N-1 fallback, the `install` → `zerith-ctl`
+update lifecycle, writable subvolumes, and factory reset — are the working
+foundation. It is not yet a daily driver; treat it as a system to learn from
+and build on.

@@ -45,17 +45,19 @@ retry 20 resolve_dev || die "$BOOTDEV not found"
 
 mkdir -p /mnt /sysroot
 mount "$DEV" /mnt || die "mount $DEV failed"
-BASE="/mnt/deploy/$deploy"
+# /mnt is the top-level subvol; the deployment store lives in the @deploy
+# subvol, which appears here as the directory "@deploy".
+BASE="/mnt/@deploy/$deploy"
 
 # --- composefs root ------------------------------------------------------------
 # composefs needs a real loop device and there's no udev here to make one;
 # priming an erofs loop mount first gets the kernel to set one up.
 mkdir -p /tmp/prime
 mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
-mount.composefs "$BASE/root.cfs" /sysroot -o basedir=/mnt/deploy/shared/objects \
+mount.composefs "$BASE/root.cfs" /sysroot -o basedir=/mnt/@deploy/shared/objects \
     || die "composefs mount failed"
 
-EFIDEV="$(findfs LABEL=efi_zerith 2>/dev/null)"
+EFIDEV="$(findfs LABEL=efi-zerith 2>/dev/null)"
 [ -n "$EFIDEV" ] && [ -b "$EFIDEV" ] || die "EFI partition not found"
 
 mount -t vfat "$EFIDEV" /sysroot/boot || die "EFI mount failed"
