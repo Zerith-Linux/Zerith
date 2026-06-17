@@ -107,14 +107,14 @@ symlinks into `/usr`, and everything the OS ships lives under `/usr`.
 
 ### Disk layout
 
-Disk (`/dev/vda`), GPT:
+Disk (`/dev/sdx`), GPT:
 
 | Partition | Type        | Filesystem | Purpose                                          |
 |-----------|-------------|------------|--------------------------------------------------|
-| `vda1`    | EFI System  | FAT32      | Limine + role-named UKIs (`/zerith/current.efi`, `/zerith/fallback.efi`) |
-| `vda2`    | Linux       | btrfs      | composefs images, object store, writable state   |
+| `sdx1`    | EFI System  | FAT32      | Limine + role-named UKIs (`/zerith/current.efi`, `/zerith/fallback.efi`) |
+| `sdx2`    | Linux       | btrfs      | composefs images, object store, writable state   |
 
-btrfs contents on `vda2`:
+btrfs contents on `sdx2`:
 
 ```
 @deploy                       # subvolume → /deploy
