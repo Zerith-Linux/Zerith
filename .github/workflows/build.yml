@@ -120,50 +120,41 @@ jobs:
         run: |
           set -e
           buildah unshare bash -c '
+            set -e
             buildah images
-
             ctr=$(buildah from containers-storage:${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG_PREFIX }}${{ env.DEFAULT_TAG }})
             mnt=$(buildah mount "$ctr")
 
-            # Recreate mutable directories
-            for d in etc var home dev proc sys run tmp mnt; do
+            # 1. Clean runtime/cache data IN THE IMAGE (note the $mnt prefix on every path)
+            rm -rf \
+                "$mnt"/var/lib/pacman/sync/* \
+                "$mnt"/var/tmp/* \
+                "$mnt"/var/lib/dbus/machine-id
+            find "$mnt/var/cache" "$mnt/var/log" -type f -delete 2>/dev/null || true
+
+            # 2. Rootfs layout BEFORE capture, so roothome/srv are included in factory /var
+            rm -rf "$mnt/root" "$mnt/srv"
+            mkdir -p "$mnt/var/roothome" "$mnt/var/srv"
+            ln -sfn var/roothome "$mnt/root"
+            ln -sfn var/srv      "$mnt/srv"
+
+            # 3. Preserve factory defaults — capture /var and relocate /etc -> /usr/etc
+            mkdir -p "$mnt/usr/share/factory"
+            cp -a "$mnt/var" "$mnt/usr/share/factory/var"
+            mkdir -p "$mnt/usr/etc"
+            cp -a "$mnt/etc/." "$mnt/usr/etc/"
+            rm -f "$mnt/usr/etc/machine-id"
+
+            # 4. NOW blank the mutable dirs back to empty mountpoints
+            for d in etc var home dev proc sys run tmp mnt boot deploy; do
                 rm -rf "$mnt/$d"
                 mkdir -p "$mnt/$d"
             done
             chmod 1777 "$mnt/tmp"
 
-            # Clean runtime/cache data
-            rm -rf \
-                /var/lib/pacman/sync/* \
-                /var/tmp/* \
-                /var/lib/dbus/machine-id
-
-            find /var/cache /var/log -type f -delete
-
-            # Preserve factory defaults
-            mkdir -p /usr/share/factory
-            cp -a /var /usr/share/factory/var
-
-            mkdir -p /usr/etc
-            cp -a /etc/. /usr/etc/
-            rm -f /usr/etc/machine-id
-
-            # Rootfs layout
-            rm -rf "$mnt/root" "$mnt/srv"
-
-            mkdir -p \
-                "$mnt/boot" \
-                "$mnt/deploy" \
-                "$mnt/var/roothome" \
-                "$mnt/var/srv"
-
-            ln -sfn var/roothome "$mnt/root"
-            ln -sfn var/srv      "$mnt/srv"
-
             buildah unmount "$ctr"
             buildah commit "$ctr" post-processed
             buildah rm "$ctr"
-
             for tag in ${{ steps.metadata.outputs.tags }}; do
               buildah tag post-processed "$tag"
             done
