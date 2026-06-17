@@ -94,6 +94,8 @@ RUN pacman -Syu --noconfirm \
     wget \
     less \
     nano \
+    networkmanager \
+    networkmanager-dinit \
     vim \
     tar \
     gzip \
