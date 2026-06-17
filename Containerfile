@@ -91,8 +91,11 @@ RUN pacman -Syu --noconfirm \
     dosfstools \
     efibootmgr \
     git \
+    greetd \
     greetd-dinit \
     sudo \
+    seatd \
+    seatd-dinit \
     shadow \
     iproute2 \
     iputils \
@@ -132,12 +135,16 @@ RUN useradd -m -G wheel aur && \
 
 RUN echo 'root:root' | chpasswd #for debugging purposes
 
-RUN dinitctl -o enable NetworkManager
+RUN dinitctl -o enable NetworkManager && \
+    dinitctl -o enable seatd && \
+    dinitctl -o disable getty1
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
 
 RUN mkdir -p /usr/lib/tmpfiles.d && \
     printf 'd /var/log/dinit 0755 root root -\n' > /usr/lib/tmpfiles.d/zerith-dinit.conf
+
+RUN echo "LIBSEAT_BACKEND=seatd" >> /etc/environment
 
 RUN rm -rf /usr/lib/systemd /etc/systemd /var/lib/systemd
