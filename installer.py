@@ -147,9 +147,10 @@ def init_layout(sysroot: Path, efi: Path) -> None:
             continue
         run(["btrfs", "subvolume", "create", str(path)])
 
-    deploy = sysroot / "deploy"
+    # Populate the @deploy subvolume created above (init mounts subvol=@deploy
+    # at /deploy, so images, the object store, and role symlinks live INSIDE it).
+    deploy = sysroot / "@deploy"
     for d in (deploy / "shared" / "objects",   # canonical content-addressed store
-              deploy / "zenith",               # state.json lives here
               # bootable UKIs (current.efi/fallback.efi)
               efi / "zerith"):
         if DRY_RUN:
@@ -165,11 +166,12 @@ def init_layout(sysroot: Path, efi: Path) -> None:
 
 class Source:
     def __init__(self, rootfs: Path, uki: Path, deploy_id: str, version: str,
-                 cleanup=None):
+                 image: str | None = None, cleanup=None):
         self.rootfs = rootfs
         self.uki = uki
         self.deploy_id = deploy_id
         self.version = version
+        self.image = image
         self._cleanup = cleanup
 
     def cleanup(self) -> None:
@@ -181,7 +183,7 @@ def source_from_image(image: str, uki_in_image: str) -> Source:
     run(["podman", "pull", image])
     fmt = '{{ index .Labels "%s" }}'
     deploy_id = run(["podman", "image", "inspect", "--format",
-                   fmt % "org.zerith.deploy-id", image], capture=True)
+                     fmt % "org.zerith.deploy-id", image], capture=True)
     version = run(["podman", "image", "inspect", "--format",
                    fmt % "org.opencontainers.image.version", image], capture=True)
     if not deploy_id and not DRY_RUN:
@@ -193,6 +195,7 @@ def source_from_image(image: str, uki_in_image: str) -> Source:
         uki=rootfs / uki_in_image,
         deploy_id=deploy_id or "dryrunid00000000",
         version=version or "unknown",
+        image=image,
         cleanup=lambda: run(["podman", "image", "unmount", image]),
     )
 
@@ -209,39 +212,76 @@ def source_from_rootfs(rootfs: Path, uki: Path, deploy_id: str,
 
 
 # --------------------------------------------------------------------------- #
-# State — current/fallback/staging roles (3-deployment pool)
+# Deployment roles (symlinks) + per-deployment metadata
 # --------------------------------------------------------------------------- #
+#
+# Roles are relative symlinks inside @deploy:
+#     @deploy/current   -> <id>      # the N (default-boot) deployment
+#     @deploy/fallback  -> <id>      # the N-1 known-good deployment
+#     @deploy/staging   -> <id>      # transient, only present during an update
+#
+# A role change is a single atomic rename(). Boot never reads these — the UKI
+# carries deploy=<id> and the ESP has static current/fallback.efi — so they
+# exist purely for host-side update tooling. Each deployment is self-describing
+# via @deploy/<id>/deployment.json and is fully removed by deleting its dir, so
+# there's no central file to keep in sync. GC stays keyed on object link count.
 
-def state_path(sysroot: Path) -> Path:
-    return sysroot / "deploy" / "zenith" / "state.json"
+META_SCHEMA = 1
 
 
-def init_state(src: Source) -> dict:
-    return {
-        "current": src.deploy_id,
-        "fallback": None,
-        "staging": None,
-        "next_seq": 2,
-        "deployments": {
-            src.deploy_id: {
-                "version": src.version,
-                "seq": 1,
-                "deployed_at": now(),
-            },
-        },
+def deploy_root(sysroot: Path) -> Path:
+    return sysroot / "@deploy"
+
+
+def write_deployment_meta(deploy_dir: Path, src: Source) -> None:
+    """Write self-describing metadata alongside the deployment image."""
+    meta = {
+        "schema": META_SCHEMA,
+        "deploy_id": src.deploy_id,
+        "version": src.version,
+        "image": src.image,
+        "deployed_at": now(),
     }
-
-
-def save_state(sysroot: Path, state: dict) -> None:
-    path = state_path(sysroot)
+    path = deploy_dir / "deployment.json"
     if DRY_RUN:
-        log(f"[dry-run] write state -> {path}")
-        vlog(json.dumps(state, indent=2))
+        log(f"[dry-run] write {path}")
+        vlog(json.dumps(meta, indent=2))
         return
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2) + "\n")
-    tmp.replace(path)
-    vlog(f"wrote state -> {path}")
+    path.write_text(json.dumps(meta, indent=2) + "\n")
+    vlog(f"wrote {path}")
+
+
+def set_role(sysroot: Path, role: str, deploy_id: str) -> None:
+    """Point a role (current/fallback/staging) at <deploy_id>, atomically.
+
+    The link target is RELATIVE (just the id), so it resolves no matter where
+    @deploy is mounted — the installer's tempdir, /mnt/@deploy in the initramfs,
+    or /deploy in the booted system.
+    """
+    root = deploy_root(sysroot)
+    link = root / role
+    if DRY_RUN:
+        log(f"[dry-run] ln -sfn {deploy_id} {link}")
+        return
+    tmp = root / f".{role}.tmp"
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    tmp.symlink_to(deploy_id)      # relative target
+    os.replace(tmp, link)          # atomic rename over any existing role link
+    vlog(f"role {role} -> {deploy_id}")
+
+
+def write_source_config(sysroot: Path, image: str) -> None:
+    """Seed the update channel (zerith-ctl reads @deploy/source.conf), so that
+    `update` works out of the box on first boot without re-specifying the image.
+    """
+    path = deploy_root(sysroot) / "source.conf"
+    data = {"schema": 1, "image": image, "updated_at": now()}
+    if DRY_RUN:
+        log(f"[dry-run] write {path} (image={image})")
+        return
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    vlog(f"update channel -> {image}")
 
 
 # --------------------------------------------------------------------------- #
@@ -285,15 +325,57 @@ def write_limine(efi: Path) -> None:
 # Limine installation
 # --------------------------------------------------------------------------- #
 
-def install_limine(efi: Path, disk: Path, esp_part: str) -> None:
-    """Copy Limine EFI loader to ESP and create UEFI boot entry."""
+EFI_LABEL = "Zerith Boot Manager"
+
+
+def esp_block_device(efi: Path) -> str | None:
+    """Block device backing the mounted ESP (e.g. /dev/nvme0n1p1), via /proc/mounts."""
+    def unescape(p: str) -> str:  # /proc/mounts octal-escapes special chars
+        return (p.replace(r"\040", " ").replace(r"\011", "\t")
+                 .replace(r"\012", "\n").replace(r"\134", "\\"))
+
+    target = os.path.realpath(str(efi))
+    found: str | None = None
+    for line in Path("/proc/mounts").read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].startswith("/dev/"):
+            if os.path.realpath(unescape(parts[1])) == target:
+                found = parts[0]
+    return found
+
+
+def disk_and_partnum(part_dev: str) -> tuple[str, str] | None:
+    """Resolve a partition node to (whole-disk node, partition number) via sysfs.
+
+    Handles /dev/sda2, /dev/nvme0n1p2, /dev/mmcblk0p2 uniformly without guessing
+    the 'p' separator.
+    """
+    name = os.path.basename(part_dev)
+    sysblk = Path("/sys/class/block") / name
+    pfile = sysblk / "partition"
+    if not pfile.is_file():
+        return None
+    part_num = pfile.read_text().strip()
+    parent = os.path.basename(os.path.dirname(os.path.realpath(str(sysblk))))
+    return (f"/dev/{parent}", part_num) if parent else None
+
+
+def install_limine(efi: Path, disk: Path | None = None,
+                   esp_part: str | None = None) -> None:
+    """Copy the Limine EFI loader to the ESP and register a UEFI boot entry.
+
+    Symmetric across both install modes: with --disk the disk/partition are known
+    up front; in pre-mounted mode they're resolved from whatever backs the ESP
+    mountpoint. The loader copy always runs; only the efibootmgr step needs the
+    disk/partition, and it's a no-op if an entry already exists (idempotent).
+    """
     if DRY_RUN:
-        log("[dry-run] install Limine")
+        log("[dry-run] install Limine (copy loader + efibootmgr entry)")
         return
 
     limine_src = "/usr/share/limine/BOOTX64.EFI"
     if not os.path.isfile(limine_src):
-        log("warning: Limine EFI loader not found at %s, skipping" % limine_src)
+        log(f"warning: Limine EFI loader not found at {limine_src}, skipping")
         return
 
     # Destination: /EFI/zerith-limine/BOOTX64.EFI
@@ -302,12 +384,25 @@ def install_limine(efi: Path, disk: Path, esp_part: str) -> None:
     shutil.copy2(limine_src, dest_dir / "BOOTX64.EFI")
     vlog(f"copied Limine loader to {dest_dir / 'BOOTX64.EFI'}")
 
-    # Prepare efibootmgr command
-    m = re.search(r'p?(\d+)$', esp_part)
-    if not m:
-        log("warning: could not parse partition number from %s, skipping efibootmgr" % esp_part)
+    # Resolve disk + partition number. --disk mode passes them in; otherwise
+    # derive them from the device backing the mounted ESP.
+    part_num: str | None = None
+    if esp_part is not None:
+        m = re.search(r'p?(\d+)$', esp_part)
+        part_num = m.group(1) if m else None
+    if disk is None or part_num is None:
+        dev = esp_block_device(efi)
+        resolved = disk_and_partnum(dev) if dev else None
+        if resolved:
+            if disk is None:
+                disk = Path(resolved[0])
+            if part_num is None:
+                part_num = resolved[1]
+
+    if disk is None or part_num is None:
+        log("warning: could not determine ESP disk/partition; loader copied but "
+            "no UEFI boot entry created (add one manually with efibootmgr)")
         return
-    part_num = m.group(1)
 
     if not shutil.which("efibootmgr"):
         log("warning: efibootmgr not found, skipping boot entry creation")
@@ -316,16 +411,20 @@ def install_limine(efi: Path, disk: Path, esp_part: str) -> None:
         log("warning: efivars not mounted, skipping boot entry creation")
         return
 
-    cmd = [
+    # Idempotent: don't stack duplicate entries on re-runs.
+    if EFI_LABEL in run(["efibootmgr"], capture=True):
+        vlog(f"UEFI boot entry {EFI_LABEL!r} already present, leaving it")
+        return
+
+    run([
         "efibootmgr",
         "--create",
         "--disk", str(disk),
         "--part", part_num,
-        "--label", "Zerith Boot Manager",
+        "--label", EFI_LABEL,
         "--loader", r"\EFI\zerith-limine\BOOTX64.EFI",
-        "--unicode"
-    ]
-    run(cmd)
+        "--unicode",
+    ])
     log("Limine boot entry created")
 
 
@@ -334,8 +433,8 @@ def install_limine(efi: Path, disk: Path, esp_part: str) -> None:
 # --------------------------------------------------------------------------- #
 
 def deploy(sysroot: Path, efi: Path, src: Source) -> None:
-    shared = sysroot / "deploy" / "shared" / "objects"
-    deploy_dir = sysroot / "deploy" / src.deploy_id
+    shared = sysroot / "@deploy" / "shared" / "objects"
+    deploy_dir = sysroot / "@deploy" / src.deploy_id
     holder = deploy_dir / "objects"
     root_cfs = deploy_dir / "root.cfs"
     btrfs_uki = deploy_dir / "zerith.efi"          # per-deployment source of truth
@@ -374,12 +473,14 @@ def deploy(sysroot: Path, efi: Path, src: Source) -> None:
         shutil.copy2(src.uki, esp_uki)
         vlog(f"installed UKI -> {esp_uki}")
 
-    state = init_state(src)
-    save_state(sysroot, state)
+    write_deployment_meta(deploy_dir, src)
+    set_role(sysroot, "current", src.deploy_id)   # fresh install: only current
+    if src.image:                                 # --image: seed the update channel
+        write_source_config(sysroot, src.image)
     write_limine(efi)
 
-    log(f"installed deployment {
-        src.deploy_id} (version {src.version}) as current")
+    log(f"installed deployment {src.deploy_id} "
+        f"(version {src.version}) as current")
 
 
 # --------------------------------------------------------------------------- #
@@ -446,11 +547,15 @@ def main(argv: list[str] | None = None) -> int:
         esp_part, btrfs_part = partition_disk(
             args.disk, args.esp_size, args.label)
         sysroot, efi, unmount = mount_targets(esp_part, btrfs_part)
-        # Install Limine after mounting
-        if not args.no_limine:
-            install_limine(efi, args.disk, esp_part)
+        limine_disk, limine_part = args.disk, esp_part
     else:
         sysroot, efi, unmount = args.sysroot, args.efi, (lambda: None)
+        # pre-mounted ESP: disk/partition resolved from the mount in install_limine
+        limine_disk, limine_part = None, None
+
+    # Install Limine in both modes (loader copy + UEFI boot entry).
+    if not args.no_limine:
+        install_limine(efi, limine_disk, limine_part)
 
     try:
         init_layout(sysroot, efi)

@@ -1,7 +1,7 @@
 # Zerith
 
 An immutable, image-based Linux distribution built on Artix, with a
-composefs read-only root, Linear Cascade Deployment with N-1 fallback,
+composefs read-only root, role-based deployments with an N-1 fallback,
 and a true factory-reset model.
 
 ---
@@ -50,8 +50,9 @@ UEFI firmware → Limine (ESP) → zerith.efi (UKI) → initramfs → composefs 
    the real system.
 4. **dinit** takes over as PID 1 inside the immutable root.
 
-Kernel command line: `deploy=a boot=/dev/vda2` — `deploy` selects the deployment,
-`boot` names the device holding the composefs images and writable state.
+Kernel command line: `deploy=<id>` — baked into each deployment's UKI at build
+time, it names which deployment directory to mount. The boot device is located
+by filesystem label (`LABEL=zerith`), so the command line carries no device path.
 
 ### The read-only root (composefs)
 
@@ -75,15 +76,17 @@ Disk (`/dev/vda`), GPT:
 
 | Partition | Type        | Filesystem | Purpose                                          |
 |-----------|-------------|------------|--------------------------------------------------|
-| `vda1`    | EFI System  | FAT32      | Limine + per-deployment UKIs (`/deploy/<id>/zerith.efi`) |
+| `vda1`    | EFI System  | FAT32      | Limine + role-named UKIs (`/zerith/current.efi`, `/zerith/fallback.efi`) |
 | `vda2`    | Linux       | btrfs      | composefs images, object store, writable state   |
 
 btrfs contents on `vda2`:
 
 ```
-/deploy/a/root.cfs            # deployment A image index (N)
-/deploy/b/root.cfs            # deployment B image index (N-1 fallback)
-/deploy/shared/objects/       # shared content-addressed object store
+@deploy                       # subvolume → /deploy
+  <id>/root.cfs               #   per-deployment composefs index (current = N)
+  <id>/zerith.efi             #   per-deployment UKI (source for the ESP copy)
+  shared/objects/             #   shared content-addressed object store
+  state.json                  #   deployment roles: current / fallback / staging
 @var                          # subvolume → /var   (persistent)
 @home                         # subvolume → /home  (persistent)
 ```
@@ -100,34 +103,44 @@ btrfs contents on `vda2`:
 | `/root`, `/srv`, `/usr/local` | symlinks → `/var/...` | writable via `@var`                              |
 
 The initramfs mounts only what must exist before `init` runs (the composefs
-root, `@var`, `@home`, and the `/etc` overlay). Everything volatile is left to
-the init system.
+root, `@var`, `@home`, `@deploy`, and the `/etc` overlay). Everything volatile
+is left to the init system.
 
-### Linear Cascade Deployment
+### Deployments and the N-1 fallback
 
-Zerith uses a **Linear Cascade** model with an **N-1 fallback** state:
+Each system image is identified by its own **deploy id** (baked into its UKI as
+`deploy=<id>`) and lives in its own directory under `@deploy`. Which image plays
+which part is tracked in `state.json` by **role**, not by directory name:
 
-- New system images are always staged to deployment **`a`**.
-- Before a new image is staged, the current contents of deployment `a` are
-  **cascaded down to deployment `b`**.
-- Deployment `b` therefore always holds a reliable **N-1 fallback** of the previous
-  known-good state.
+- **`current`** — the image booted by default (the `N` state).
+- **`fallback`** — the previous known-good image, kept for recovery (the `N-1`
+  state).
+- **`staging`** — a freshly written image not yet promoted to `current`.
+
+The ESP carries two fixed, role-named UKIs that Limine chainloads:
+`/zerith/current.efi` and `/zerith/fallback.efi`. An update writes a new
+deployment, copies its UKI into `current.efi`, and demotes the old current to
+`fallback.efi`; because each UKI already has its `deploy=<id>` baked in, the ESP
+file names can stay static while still mounting the right deployment.
 
 ```
    new image
-       │  stage
+       │  write + promote to "current"
        ▼
-  ┌────────────────┐   cascade   ┌────────────────┐
-  │  deployment a  │ ──────────▶ │  deployment b  │
-  │      (N)       │             │      (N-1)     │
-  └────────────────┘             └────────────────┘
-                                 (old N-1 discarded)
+  ┌──────────────────┐   demote    ┌──────────────────┐
+  │  current  (N)    │ ──────────▶ │  fallback (N-1)  │
+  └──────────────────┘             └──────────────────┘
+                                   (old fallback discarded)
 ```
 
-If deployment `a` fails to boot or proves bad, the system falls back to deployment `b`,
-the last known-good image. Because the object store is shared between deployments,
-cascading and staging move only the small `root.cfs` index and any new
-objects — never whole filesystem copies.
+If `current` fails to boot, selecting the previous Limine entry boots
+`fallback` — the last known-good image. Because the object store is shared
+across deployments, promotion and demotion move only the small `root.cfs` index
+and any new objects, never whole filesystem copies.
+
+> The installer currently performs the **initial install** (one deployment as
+> `current`, with `state.json` seeded for the role model above). The full
+> promote/demote update flow is still in progress — see **Status**.
 
 ### Writable state and factory reset
 
@@ -164,8 +177,9 @@ Zerith images are produced from container images, not assembled on the target:
    the shared object store.
 6. **Build the UKI** — `ukify` bundles the kernel + initramfs into
    `zerith.efi`.
-7. **Deploy** — cascade deployment `a` → deployment `b`, stage the new image to deployment `a`,
-   sync objects, and place the UKI on the ESP.
+7. **Deploy** — write the new image as a deploy-id directory, sync objects into
+   the shared store, promote it to `current` (demoting the old current to
+   `fallback`), and copy its UKI to `/zerith/current.efi` on the ESP.
 
 ---
 
@@ -173,5 +187,5 @@ Zerith images are produced from container images, not assembled on the target:
 
 Zerith is an in-development, experimental distribution. Expect rough edges
 around tooling and update orchestration. Core mechanics — composefs root,
-UKI/Limine boot, cascade deployments, writable subvolumes, and factory reset — are
+UKI/Limine boot, role-based deployments, writable subvolumes, and factory reset — are
 the working foundation.

@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""
+
+Operates on a running Zerith host (the @deploy subvolume mounted at /deploy and
+the ESP mounted at /efi):
+
+    @deploy/                         ESP/
+      current  -> <id>                 zerith/current.efi
+      fallback -> <id>                 zerith/fallback.efi
+      staging  -> <id>   (transient)
+      <id>/{root.cfs,zerith.efi,objects/,deployment.json}
+      shared/objects/
+
+Roles are relative symlinks; the ESP's current.efi / fallback.efi are what Limine
+actually chainloads (each UKI carries deploy=<id>, so the file names stay fixed
+while the contents change). This tool keeps the two sides in step and reclaims
+space via hardlink-count GC.
+
+Commands:
+    status              show channel + current / fallback / staging
+    deploy IMAGE        set the update channel to IMAGE, pull it, and promote to current
+    update              pull the configured channel image and promote if it changed
+    rollback | swap     swap current <-> fallback
+    gc                  drop unreferenced deployments and orphaned objects
+
+The update channel (which image `update` pulls) lives in @deploy/source.conf,
+seeded by the installer from its --image. Only `deploy` changes it — that's how
+you switch tag or repo, e.g. `deploy ghcr.io/zerith-linux/zerith-nvidia:latest`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import NoReturn
+
+DEFAULT_DEPLOY = Path("/deploy")
+DEFAULT_ESP = Path("/efi")
+DEFAULT_UKI_IN_IMAGE = "usr/lib/uki/zerith.efi"   # matches the Containerfile
+# update channel, lives in @deploy
+SOURCE_CONF_NAME = "source.conf"
+CONFIG_SCHEMA = 1
+META_SCHEMA = 1
+ROLES = ("current", "fallback", "staging")
+
+DRY_RUN = False
+VERBOSE = False
+
+
+# --------------------------------------------------------------------------- #
+# Utilities (kept in step with installer.py)
+# --------------------------------------------------------------------------- #
+
+def log(msg: str) -> None:
+    print(f"zerith-ctl: {msg}")
+
+
+def vlog(msg: str) -> None:
+    if VERBOSE:
+        log(msg)
+
+
+def die(msg: str) -> "NoReturn":
+    print(f"zerith-ctl: error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd: list[str], *, capture: bool = False) -> str:
+    printable = " ".join(cmd)
+    if DRY_RUN:
+        log(f"[dry-run] {printable}")
+        return ""
+    vlog(f"exec: {printable}")
+    res = subprocess.run(cmd, text=True, capture_output=capture)
+    if res.returncode != 0:
+        if capture and res.stderr:
+            sys.stderr.write(res.stderr)
+        die(f"command failed ({res.returncode}): {printable}")
+    return (res.stdout or "").strip() if capture else ""
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def require_root() -> None:
+    if not DRY_RUN and os.geteuid() != 0:
+        die("must run as root")
+
+
+# --------------------------------------------------------------------------- #
+# Roles (relative symlinks) + per-deployment metadata
+# --------------------------------------------------------------------------- #
+
+def deploy_dir(deploy: Path, deploy_id: str) -> Path:
+    return deploy / deploy_id
+
+
+def read_role(deploy: Path, role: str) -> str | None:
+    """Return the deploy id a role points at, or None if unset/dangling."""
+    link = deploy / role
+    if not link.is_symlink():
+        return None
+    return os.path.basename(os.readlink(link))
+
+
+def set_role(deploy: Path, role: str, deploy_id: str) -> None:
+    """Point a role at <deploy_id> atomically, with a RELATIVE link target."""
+    link = deploy / role
+    if DRY_RUN:
+        log(f"[dry-run] ln -sfn {deploy_id} {link}")
+        return
+    tmp = deploy / f".{role}.tmp"
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    # relative — resolves wherever @deploy is mounted
+    tmp.symlink_to(deploy_id)
+    # atomic rename over any existing role link
+    os.replace(tmp, link)
+    vlog(f"role {role} -> {deploy_id}")
+
+
+def clear_role(deploy: Path, role: str) -> None:
+    link = deploy / role
+    if DRY_RUN:
+        log(f"[dry-run] rm -f {link}")
+        return
+    if link.is_symlink() or link.exists():
+        link.unlink()
+        vlog(f"role {role} cleared")
+
+
+def write_meta(ddir: Path, *, deploy_id: str, version: str, image: str | None) -> None:
+    meta = {
+        "schema": META_SCHEMA,
+        "deploy_id": deploy_id,
+        "version": version,
+        "image": image,
+        "deployed_at": now(),
+    }
+    path = ddir / "deployment.json"
+    if DRY_RUN:
+        log(f"[dry-run] write {path}")
+        vlog(json.dumps(meta, indent=2))
+        return
+    path.write_text(json.dumps(meta, indent=2) + "\n")
+    vlog(f"wrote {path}")
+
+
+def load_meta(deploy: Path, deploy_id: str | None) -> dict:
+    if not deploy_id:
+        return {}
+    try:
+        return json.loads((deploy_dir(deploy, deploy_id) / "deployment.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+# --------------------------------------------------------------------------- #
+# Update channel (central config)
+# --------------------------------------------------------------------------- #
+#
+# A single file records the image `update` pulls. Only `deploy` rewrites it, so
+# switching tag or repo is an explicit `deploy <ref>`. It lives in @deploy
+# (seeded by the installer), so it travels with the deployment subvolume and
+# needs no /etc overlay.
+
+def read_source(config: Path) -> str | None:
+    try:
+        return json.loads(config.read_text()).get("image")
+    except (OSError, ValueError):
+        return None
+
+
+def write_source(config: Path, image: str) -> None:
+    data = {"schema": CONFIG_SCHEMA, "image": image, "updated_at": now()}
+    if DRY_RUN:
+        log(f"[dry-run] write {config} (image={image})")
+        return
+    config.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config.with_name(config.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, config)
+    vlog(f"update channel -> {image}")
+
+
+# --------------------------------------------------------------------------- #
+# ESP UKIs
+# --------------------------------------------------------------------------- #
+
+def esp_uki(esp: Path, role: str) -> Path:
+    return esp / "zerith" / f"{role}.efi"
+
+
+def atomic_copy(src: Path, dst: Path) -> None:
+    """Copy src onto dst via a temp file + rename (atomic replace, incl. on vfat)."""
+    if DRY_RUN:
+        log(f"[dry-run] cp {src} -> {dst}")
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.tmp")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+    vlog(f"copied {src} -> {dst}")
+
+
+# --------------------------------------------------------------------------- #
+# Source image
+# --------------------------------------------------------------------------- #
+
+class Source:
+    def __init__(self, rootfs: Path, uki: Path, deploy_id: str, version: str,
+                 image: str, cleanup=None):
+        self.rootfs = rootfs
+        self.uki = uki
+        self.deploy_id = deploy_id
+        self.version = version
+        self.image = image
+        self._cleanup = cleanup
+
+    def cleanup(self) -> None:
+        if self._cleanup:
+            self._cleanup()
+
+
+def source_from_image(image: str, uki_in_image: str) -> Source:
+    run(["podman", "pull", image])
+    fmt = '{{ index .Labels "%s" }}'
+    deploy_id = run(["podman", "image", "inspect", "--format",
+                     fmt % "org.zerith.deploy-id", image], capture=True)
+    version = run(["podman", "image", "inspect", "--format",
+                   fmt % "org.opencontainers.image.version", image], capture=True)
+    if not deploy_id and not DRY_RUN:
+        die(f"image {image} has no org.zerith.deploy-id label")
+    mountpoint = run(["podman", "image", "mount", image], capture=True)
+    rootfs = Path(mountpoint or "/dry-run-rootfs")
+    return Source(
+        rootfs=rootfs,
+        uki=rootfs / uki_in_image,
+        deploy_id=deploy_id or "dryrunid00000000",
+        version=version or "unknown",
+        image=image,
+        cleanup=lambda: run(["podman", "image", "unmount", image]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Stage / promote / rollback / gc
+# --------------------------------------------------------------------------- #
+
+def stage(deploy: Path, src: Source) -> None:
+    """Materialize a deployment on disk and mark it `staging`. Idempotent."""
+    shared = deploy / "shared" / "objects"
+    ddir = deploy_dir(deploy, src.deploy_id)
+    holder = ddir / "objects"
+    root_cfs = ddir / "root.cfs"
+    btrfs_uki = ddir / "zerith.efi"
+
+    if not DRY_RUN and not src.uki.is_file():
+        die(f"image UKI not found at {src.uki}")
+
+    if (not DRY_RUN) and root_cfs.exists():
+        log(f"deployment {src.deploy_id} already on disk, reusing")
+    else:
+        if DRY_RUN:
+            log(f"[dry-run] mkdir -p {ddir}")
+        else:
+            ddir.mkdir(parents=True, exist_ok=True)
+
+        # Render the read-only composefs image into the SHARED object store.
+        run(["mkcomposefs", f"--digest-store={shared}",
+             str(src.rootfs), str(root_cfs)])
+
+        # Per-deployment hardlink holder: every object now has one extra link.
+        # GC keys off that link count, so this is what keeps shared objects alive.
+        if DRY_RUN:
+            log(f"[dry-run] mkdir -p {holder}")
+            log(f"[dry-run] cp -a -l {shared}/. {holder}/")
+        else:
+            holder.mkdir(parents=True, exist_ok=True)
+            run(["cp", "-a", "-l", f"{shared}/.", f"{holder}/"])
+
+        if DRY_RUN:
+            log(f"[dry-run] cp {src.uki} -> {btrfs_uki}")
+        else:
+            shutil.copy2(src.uki, btrfs_uki)
+
+        write_meta(ddir, deploy_id=src.deploy_id,
+                   version=src.version, image=src.image)
+
+    set_role(deploy, "staging", src.deploy_id)
+
+
+def promote(deploy: Path, esp: Path, new_id: str) -> None:
+    """Make `new_id` the current deployment; demote the old current to fallback."""
+    old_current = read_role(deploy, "current")
+    if new_id == old_current:
+        log(f"{new_id} is already current; nothing to promote")
+        clear_role(deploy, "staging")
+        return
+
+    new_uki = deploy_dir(deploy, new_id) / "zerith.efi"
+    if not DRY_RUN and not new_uki.is_file():
+        die(f"staged UKI missing: {new_uki}")
+
+    # ESP first, in crash-safe order: keep a valid fallback before swinging
+    # current to the new image. (Boot reads the ESP, not the role symlinks.)
+    cur_efi = esp_uki(esp, "current")
+    if old_current is not None and (DRY_RUN or cur_efi.is_file()):
+        atomic_copy(cur_efi, esp_uki(esp, "fallback"))
+    atomic_copy(new_uki, cur_efi)
+
+    # Role symlinks mirror the ESP.
+    if old_current is not None:
+        set_role(deploy, "fallback", old_current)
+    set_role(deploy, "current", new_id)
+    clear_role(deploy, "staging")
+
+    # Whatever fell out of the current/fallback pair is now unreferenced.
+    gc(deploy)
+    log(f"promoted {new_id}" + (f" (previous current {old_current} -> fallback)"
+                                if old_current else ""))
+
+
+def rollback(deploy: Path, esp: Path) -> None:
+    """Swap current <-> fallback on both the ESP and the role symlinks."""
+    cur = read_role(deploy, "current")
+    fb = read_role(deploy, "fallback")
+    if fb is None:
+        die("no fallback deployment to roll back to")
+
+    cur_efi = esp_uki(esp, "current")
+    fb_efi = esp_uki(esp, "fallback")
+    if not DRY_RUN and not fb_efi.is_file():
+        die(f"fallback UKI missing on ESP: {fb_efi}")
+
+    if DRY_RUN:
+        log(f"[dry-run] swap {cur_efi} <-> {fb_efi}")
+    else:
+        tmp = cur_efi.with_name(".swap.efi.tmp")
+        shutil.copy2(cur_efi, tmp)        # save old current
+        os.replace(fb_efi, cur_efi)       # fallback becomes current
+        os.replace(tmp, fb_efi)           # old current becomes fallback
+        vlog("swapped ESP UKIs")
+
+    set_role(deploy, "current", fb)
+    if cur is not None:
+        set_role(deploy, "fallback", cur)
+    log(f"rolled back: current is now {fb} (was {cur})")
+
+
+def gc(deploy: Path) -> None:
+    """Remove any deployment not held by a role, then sweep orphaned objects.
+
+    Object GC is by hardlink count: a shared object referenced by K live
+    deployments has link count 1 + K, so count == 1 means no holder references
+    it any more. (Assumes no half-finished `stage` is in flight.)
+    """
+    protected = {read_role(deploy, r) for r in ROLES}
+    protected.discard(None)
+    shared = deploy / "shared" / "objects"
+
+    removed: list[str] = []
+    for p in sorted(deploy.iterdir()):
+        if p.is_symlink() or p.name == "shared" or p.name.startswith(".") or not p.is_dir():
+            continue
+        if p.name in protected:
+            continue
+        removed.append(p.name)
+        if DRY_RUN:
+            log(f"[dry-run] rm -rf {p}")
+        else:
+            shutil.rmtree(p)
+            vlog(f"removed deployment {p.name}")
+
+    swept = 0
+    if DRY_RUN:
+        log(f"[dry-run] sweep orphaned objects in {shared} (link count == 1)")
+    elif shared.is_dir():
+        for root, _dirs, files in os.walk(shared):
+            for name in files:
+                fp = Path(root) / name
+                try:
+                    if fp.stat().st_nlink == 1:
+                        fp.unlink()
+                        swept += 1
+                except OSError:
+                    pass
+        for root, dirs, _files in os.walk(shared, topdown=False):
+            for d in dirs:
+                try:
+                    (Path(root) / d).rmdir()       # prune now-empty dirs
+                except OSError:
+                    pass
+
+    if removed:
+        extra = f"; {swept} orphan object(s)" if swept else ""
+        log(f"gc: removed {len(removed)} deployment(s): {
+            ', '.join(removed)}{extra}")
+    else:
+        vlog("gc: nothing to remove")
+
+
+# --------------------------------------------------------------------------- #
+# Status
+# --------------------------------------------------------------------------- #
+
+def status(deploy: Path, esp: Path, config: Path) -> None:
+    print(f"channel   {read_source(config) or '(unset — run deploy IMAGE)'}")
+    for role in ROLES:
+        rid = read_role(deploy, role)
+        if rid is None:
+            print(f"{role:8}  -")
+            continue
+        meta = load_meta(deploy, rid)
+        ver = meta.get("version", "?")
+        img = meta.get("image") or "-"
+        print(f"{role:8}  {rid}  version={ver}  image={img}")
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration
+# --------------------------------------------------------------------------- #
+
+def do_deploy(deploy: Path, esp: Path, image: str, uki_in_image: str) -> None:
+    src = source_from_image(image, uki_in_image)
+    try:
+        if src.deploy_id == read_role(deploy, "current"):
+            log(f"already on {src.deploy_id} (version {
+                src.version}); up to date")
+            return
+        stage(deploy, src)
+        promote(deploy, esp, src.deploy_id)
+        log(f"now current: {src.deploy_id} (version {src.version})")
+    finally:
+        src.cleanup()
+
+
+def check_layout(deploy: Path, esp: Path) -> None:
+    if DRY_RUN:
+        return
+    if not (deploy / "shared" / "objects").is_dir():
+        die(f"{deploy} doesn't look like a Zerith @deploy mount "
+            f"(no shared/objects) — point --deploy at it")
+    if not (esp / "zerith").is_dir():
+        die(f"{esp} doesn't look like the Zerith ESP (no zerith/) — point --esp at it")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def main(argv: list[str] | None = None) -> int:
+    global DRY_RUN, VERBOSE
+
+    p = argparse.ArgumentParser(
+        prog="zerith-ctl",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--deploy", type=Path, default=DEFAULT_DEPLOY,
+                   help="@deploy subvolume mountpoint (default /deploy)")
+    p.add_argument("--esp", type=Path, default=DEFAULT_ESP,
+                   help="ESP mountpoint (default /efi)")
+    p.add_argument("--uki-in-image", default=DEFAULT_UKI_IN_IMAGE,
+                   help="UKI path inside the image")
+    p.add_argument("--config", type=Path, default=None,
+                   help="update-channel config file (default <deploy>/source.conf)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print actions without changing anything")
+    p.add_argument("-v", "--verbose", action="store_true")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="show current / fallback / staging")
+
+    d = sub.add_parser(
+        "deploy", help="set the update channel to IMAGE, pull it, and promote")
+    d.add_argument(
+        "image", help="image ref / tag, e.g. ghcr.io/zerith-linux/zerith-nvidia:latest")
+
+    sub.add_parser(
+        "update", help="pull the configured channel image and promote if it changed")
+
+    sub.add_parser("rollback", aliases=[
+                   "swap"], help="swap current <-> fallback")
+    sub.add_parser(
+        "gc", help="remove unreferenced deployments and orphaned objects")
+
+    args = p.parse_args(argv)
+    DRY_RUN = args.dry_run
+    VERBOSE = args.verbose
+    deploy, esp = args.deploy, args.esp
+    config = args.config or (deploy / SOURCE_CONF_NAME)
+
+    if args.cmd == "status":
+        status(deploy, esp, config)
+        return 0
+
+    require_root()
+    check_layout(deploy, esp)
+
+    if args.cmd == "gc":
+        gc(deploy)
+    elif args.cmd in ("rollback", "swap"):
+        rollback(deploy, esp)
+    elif args.cmd == "deploy":
+        do_deploy(deploy, esp, args.image, args.uki_in_image)
+        # deploy is the only thing that changes the channel
+        write_source(config, args.image)
+    elif args.cmd == "update":
+        image = read_source(config)
+        if not image:
+            die(f"no update channel configured in {
+                config}; run 'deploy IMAGE' first")
+        log(f"update: pulling configured channel {image}")
+        do_deploy(deploy, esp, image, args.uki_in_image)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

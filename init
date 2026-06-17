@@ -55,10 +55,15 @@ mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
 mount.composefs "$BASE/root.cfs" /sysroot -o basedir=/mnt/deploy/shared/objects \
     || die "composefs mount failed"
 
+EFIDEV="$(findfs LABEL=efi_zerith 2>/dev/null)"
+[ -n "$EFIDEV" ] && [ -b "$EFIDEV" ] || die "EFI partition not found"
+
+mount -t vfat "$EFIDEV" /sysroot/boot || die "EFI mount failed"
+
 # --- writable state (mount /var before the /etc overlay) -----------------------
 mount -t btrfs -o subvol=@var  "$DEV" /sysroot/var  || die "var mount failed"
 mount -t btrfs -o subvol=@home "$DEV" /sysroot/home || die "home mount failed"
-mount -t btrfs -o subvol=@deploy "$DEV" /sysroot/deploy || die "home mount failed"
+mount -t btrfs -o subvol=@deploy "$DEV" /sysroot/deploy || die "deploy mount failed"
 
 # first boot / factory reset: seed an empty @var from the read-only factory copy
 if [ -z "$(ls -A /sysroot/var 2>/dev/null)" ]; then
