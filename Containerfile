@@ -120,7 +120,7 @@ RUN pacman -Syu --noconfirm \
 
 RUN echo 'root:root' | chpasswd #for debugging purposes
 
-RUN dinitctl enable NetworkManager
+RUN dinitctl -o enable NetworkManager
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
