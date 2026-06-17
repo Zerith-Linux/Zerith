@@ -107,7 +107,7 @@ def partition_disk(disk: Path, esp_size: str, label: str) -> tuple[str, str]:
     run(["sgdisk", "-n2:0:0", "-t2:8300", f"-c2:{label}", str(disk)])
     run(["partprobe", str(disk)])
     esp_part, btrfs_part = partition_names(disk)
-    run(["mkfs.fat", "-F32", esp_part])
+    run(["mkfs.fat", "-F32", "-n", f"efi-{label}", esp_part])
     run(["mkfs.btrfs", "-f", "-L", label, btrfs_part])
     return esp_part, btrfs_part
 
@@ -140,9 +140,15 @@ def mount_targets(esp_part: str, btrfs_part: str):
 # --------------------------------------------------------------------------- #
 
 def init_layout(sysroot: Path, efi: Path) -> None:
+    for sub in ("@var", "@home", "@deploy"):
+        path = sysroot / sub
+        if (not DRY_RUN) and path.exists():
+            vlog(f"subvolume {sub} already present")
+            continue
+        run(["btrfs", "subvolume", "create", str(path)])
+
     deploy = sysroot / "deploy"
-    for d in (deploy,
-              deploy / "shared" / "objects",   # canonical content-addressed store
+    for d in (deploy / "shared" / "objects",   # canonical content-addressed store
               deploy / "zenith",               # state.json lives here
               # bootable UKIs (current.efi/fallback.efi)
               efi / "zerith"):
@@ -152,26 +158,17 @@ def init_layout(sysroot: Path, efi: Path) -> None:
             d.mkdir(parents=True, exist_ok=True)
             vlog(f"ensured dir {d}")
 
-    # @var / @home are btrfs subvolumes the init mounts at boot. The init seeds
-    # an empty @var from the image's factory copy on first boot, so create empty.
-    for sub in ("@var", "@home"):
-        path = sysroot / sub
-        if (not DRY_RUN) and path.exists():
-            vlog(f"subvolume {sub} already present")
-            continue
-        run(["btrfs", "subvolume", "create", str(path)])
-
 
 # --------------------------------------------------------------------------- #
 # Source resolution
 # --------------------------------------------------------------------------- #
 
 class Source:
-    def __init__(self, rootfs: Path, uki: Path, slot_id: str, version: str,
+    def __init__(self, rootfs: Path, uki: Path, deploy_id: str, version: str,
                  cleanup=None):
         self.rootfs = rootfs
         self.uki = uki
-        self.slot_id = slot_id
+        self.deploy_id = deploy_id
         self.version = version
         self._cleanup = cleanup
 
@@ -183,36 +180,36 @@ class Source:
 def source_from_image(image: str, uki_in_image: str) -> Source:
     run(["podman", "pull", image])
     fmt = '{{ index .Labels "%s" }}'
-    slot_id = run(["podman", "image", "inspect", "--format",
-                     fmt % "org.zerith.slot-id", image], capture=True)
+    deploy_id = run(["podman", "image", "inspect", "--format",
+                   fmt % "org.zerith.deploy-id", image], capture=True)
     version = run(["podman", "image", "inspect", "--format",
                    fmt % "org.opencontainers.image.version", image], capture=True)
-    if not slot_id and not DRY_RUN:
-        die(f"image {image} has no org.zerith.slot-id label")
+    if not deploy_id and not DRY_RUN:
+        die(f"image {image} has no org.zerith.deploy-id label")
     mountpoint = run(["podman", "image", "mount", image], capture=True)
     rootfs = Path(mountpoint or "/dry-run-rootfs")
     return Source(
         rootfs=rootfs,
         uki=rootfs / uki_in_image,
-        slot_id=slot_id or "dryrunid00000000",
+        deploy_id=deploy_id or "dryrunid00000000",
         version=version or "unknown",
         cleanup=lambda: run(["podman", "image", "unmount", image]),
     )
 
 
-def source_from_rootfs(rootfs: Path, uki: Path, slot_id: str,
+def source_from_rootfs(rootfs: Path, uki: Path, deploy_id: str,
                        version: str) -> Source:
     if not DRY_RUN:
         if not rootfs.is_dir():
             die(f"--rootfs {rootfs} is not a directory")
         if not uki.is_file():
             die(f"--uki {uki} not found")
-    return Source(rootfs=rootfs, uki=uki, slot_id=slot_id,
+    return Source(rootfs=rootfs, uki=uki, deploy_id=deploy_id,
                   version=version or "unknown")
 
 
 # --------------------------------------------------------------------------- #
-# State — current/fallback/staging roles (3-slot pool)
+# State — current/fallback/staging roles (3-deployment pool)
 # --------------------------------------------------------------------------- #
 
 def state_path(sysroot: Path) -> Path:
@@ -221,12 +218,12 @@ def state_path(sysroot: Path) -> Path:
 
 def init_state(src: Source) -> dict:
     return {
-        "current": src.slot_id,
+        "current": src.deploy_id,
         "fallback": None,
         "staging": None,
         "next_seq": 2,
         "deployments": {
-            src.slot_id: {
+            src.deploy_id: {
                 "version": src.version,
                 "seq": 1,
                 "deployed_at": now(),
@@ -338,14 +335,14 @@ def install_limine(efi: Path, disk: Path, esp_part: str) -> None:
 
 def deploy(sysroot: Path, efi: Path, src: Source) -> None:
     shared = sysroot / "deploy" / "shared" / "objects"
-    deploy_dir = sysroot / "deploy" / src.slot_id
+    deploy_dir = sysroot / "deploy" / src.deploy_id
     holder = deploy_dir / "objects"
     root_cfs = deploy_dir / "root.cfs"
     btrfs_uki = deploy_dir / "zerith.efi"          # per-deployment source of truth
     esp_uki = efi / "zerith" / "current.efi"       # fixed role-named bootable copy
 
     if (not DRY_RUN) and deploy_dir.exists():
-        die(f"deployment {src.slot_id} already installed at {deploy_dir}")
+        die(f"deployment {src.deploy_id} already installed at {deploy_dir}")
 
     if DRY_RUN:
         log(f"[dry-run] mkdir -p {deploy_dir}")
@@ -382,7 +379,7 @@ def deploy(sysroot: Path, efi: Path, src: Source) -> None:
     write_limine(efi)
 
     log(f"installed deployment {
-        src.slot_id} (version {src.version}) as current")
+        src.deploy_id} (version {src.version}) as current")
 
 
 # --------------------------------------------------------------------------- #
@@ -414,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rootfs", type=Path,
                    help="alternative: an extracted/mounted rootfs")
     p.add_argument("--uki", type=Path, help="UKI path (with --rootfs)")
-    p.add_argument("--slot-id", help="slot id (with --rootfs)")
+    p.add_argument("--deploy-id", help="deployment id (with --rootfs)")
     p.add_argument("--version", default="",
                    help="version label (with --rootfs)")
     p.add_argument("--uki-in-image", default=DEFAULT_UKI_IN_IMAGE,
@@ -438,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
     # source: exactly one of --image / --rootfs
     if bool(args.image) == bool(args.rootfs):
         die("provide exactly one source: --image REF  or  --rootfs DIR")
-    if args.rootfs and not (args.uki and args.slot_id):
+    if args.rootfs and not (args.uki and args.deploy_id):
         die("--rootfs also requires --uki and --deploy-id")
 
     require_root()
@@ -461,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             src = source_from_image(args.image, args.uki_in_image)
         else:
             src = source_from_rootfs(
-                args.rootfs, args.uki, args.slot_id, args.version)
+                args.rootfs, args.uki, args.deploy_id, args.version)
         try:
             deploy(sysroot, efi, src)
         finally:

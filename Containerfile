@@ -1,8 +1,8 @@
-ARG SLOT_ID
+ARG DEPLOY_ID
 
 FROM docker.io/archlinux:base AS uki-builder
 
-ARG SLOT_ID
+ARG DEPLOY_ID
 ENV INITRAMFS=/work/initramfs
 ENV APPLETS="sh mount cat mkdir ls echo sleep switch_root insmod cp findfs"
 ENV ESSENTIAL="erofs overlay loop ext4 btrfs"
@@ -64,7 +64,7 @@ RUN KVER="$(cat /kver)"; \
     ukify build \
         --linux="/usr/lib/modules/$KVER/vmlinuz" \
         --initrd=/out/initramfs.img \
-        --cmdline "slot=$SLOT_ID" \
+        --cmdline "deploy=$DEPLOY_ID" \
         --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
         --output=/out/zerith.efi
 
@@ -86,11 +86,3 @@ RUN mkdir -p /usr/etc/dinit.d && \
 
 RUN mkdir -p /usr/lib/tmpfiles.d && \
     printf 'd /var/log/dinit 0755 root root -\n' > /usr/lib/tmpfiles.d/zerith-dinit.conf
-
-RUN rm -rf /var/lib/pacman/sync/* /var/tmp/* /var/lib/dbus/machine-id && \
-    find /var/cache /var/log -type f -delete && \
-    mkdir -p /usr/share/factory && cp -a /var /usr/share/factory/var
-
-RUN mkdir -p /usr/etc && \
-    cp -a /etc/. /usr/etc/ && \
-    rm /usr/etc/machine-id || true

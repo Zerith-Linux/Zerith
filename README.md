@@ -22,7 +22,7 @@ Unified Kernel Image (UKI), and booted by Limine under UEFI.
 
 - **Immutable root** — `/usr` and the rest of `/` are read-only and
   content-addressed. The running system cannot modify its own OS files.
-- **Atomic, reversible updates** — images are staged whole; switching slots is
+- **Atomic, reversible updates** — images are staged whole; switching deployments is
   the only "update" operation, and the previous image is always retained.
 - **Clear separation of state** — OS in the image, machine config in `/etc`,
   variable data in `/var`, user data in `/home`. Nothing else persists.
@@ -41,7 +41,7 @@ Unified Kernel Image (UKI), and booted by Limine under UEFI.
 UEFI firmware → Limine (ESP) → zerith.efi (UKI) → initramfs → composefs root → switch_root → dinit
 ```
 
-1. **Limine (UEFI)** loads the selected slot's Unified Kernel Image from the
+1. **Limine (UEFI)** loads the selected deployment's Unified Kernel Image from the
    EFI System Partition.
 2. The **UKI (`zerith.efi`)** bundles the kernel and a minimal busybox
    initramfs; it is assembled with `ukify`.
@@ -50,7 +50,7 @@ UEFI firmware → Limine (ESP) → zerith.efi (UKI) → initramfs → composefs 
    the real system.
 4. **dinit** takes over as PID 1 inside the immutable root.
 
-Kernel command line: `slot=a boot=/dev/vda2` — `slot` selects the deployment,
+Kernel command line: `deploy=a boot=/dev/vda2` — `deploy` selects the deployment,
 `boot` names the device holding the composefs images and writable state.
 
 ### The read-only root (composefs)
@@ -75,14 +75,14 @@ Disk (`/dev/vda`), GPT:
 
 | Partition | Type        | Filesystem | Purpose                                          |
 |-----------|-------------|------------|--------------------------------------------------|
-| `vda1`    | EFI System  | FAT32      | Limine + per-slot UKIs (`/deploy/<slot>/zerith.efi`) |
+| `vda1`    | EFI System  | FAT32      | Limine + per-deployment UKIs (`/deploy/<id>/zerith.efi`) |
 | `vda2`    | Linux       | btrfs      | composefs images, object store, writable state   |
 
 btrfs contents on `vda2`:
 
 ```
-/deploy/a/root.cfs            # slot A image index (N)
-/deploy/b/root.cfs            # slot B image index (N-1 fallback)
+/deploy/a/root.cfs            # deployment A image index (N)
+/deploy/b/root.cfs            # deployment B image index (N-1 fallback)
 /deploy/shared/objects/       # shared content-addressed object store
 @var                          # subvolume → /var   (persistent)
 @home                         # subvolume → /home  (persistent)
@@ -107,25 +107,25 @@ the init system.
 
 Zerith uses a **Linear Cascade** model with an **N-1 fallback** state:
 
-- New system images are always staged to slot **`a`**.
-- Before a new image is staged, the current contents of slot `a` are
-  **cascaded down to slot `b`**.
-- Slot `b` therefore always holds a reliable **N-1 fallback** of the previous
+- New system images are always staged to deployment **`a`**.
+- Before a new image is staged, the current contents of deployment `a` are
+  **cascaded down to deployment `b`**.
+- Deployment `b` therefore always holds a reliable **N-1 fallback** of the previous
   known-good state.
 
 ```
    new image
        │  stage
        ▼
-  ┌───────────┐   cascade   ┌───────────┐
-  │  slot a   │ ──────────▶ │  slot b   │
-  │   (N)     │             │  (N-1)    │
-  └───────────┘             └───────────┘
-                            (old N-1 discarded)
+  ┌────────────────┐   cascade   ┌────────────────┐
+  │  deployment a  │ ──────────▶ │  deployment b  │
+  │      (N)       │             │      (N-1)     │
+  └────────────────┘             └────────────────┘
+                                 (old N-1 discarded)
 ```
 
-If slot `a` fails to boot or proves bad, the system falls back to slot `b`,
-the last known-good image. Because the object store is shared between slots,
+If deployment `a` fails to boot or proves bad, the system falls back to deployment `b`,
+the last known-good image. Because the object store is shared between deployments,
 cascading and staging move only the small `root.cfs` index and any new
 objects — never whole filesystem copies.
 
@@ -164,7 +164,7 @@ Zerith images are produced from container images, not assembled on the target:
    the shared object store.
 6. **Build the UKI** — `ukify` bundles the kernel + initramfs into
    `zerith.efi`.
-7. **Deploy** — cascade slot `a` → slot `b`, stage the new image to slot `a`,
+7. **Deploy** — cascade deployment `a` → deployment `b`, stage the new image to deployment `a`,
    sync objects, and place the UKI on the ESP.
 
 ---
@@ -173,5 +173,5 @@ Zerith images are produced from container images, not assembled on the target:
 
 Zerith is an in-development, experimental distribution. Expect rough edges
 around tooling and update orchestration. Core mechanics — composefs root,
-UKI/Limine boot, cascade slots, writable subvolumes, and factory reset — are
+UKI/Limine boot, cascade deployments, writable subvolumes, and factory reset — are
 the working foundation.

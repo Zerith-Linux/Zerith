@@ -34,10 +34,10 @@ for fs in erofs overlay; do
 done
 [ -e /dev/loop-control ] || die "loop not available"
 
-# --- pick slot, locate the boot device -----------------------------------------
+# --- pick deploy, locate the boot device ----------------------------------------
 BOOTDEV="LABEL=zerith"
 for arg in $(cat /proc/cmdline); do
-    case "$arg" in slot=*) slot="${arg#slot=}" ;; esac
+    case "$arg" in deploy=*) deploy="${arg#deploy=}" ;; esac
 done
 
 resolve_dev() { DEV="$(findfs "$BOOTDEV" 2>/dev/null)"; [ -b "$DEV" ]; }
@@ -45,7 +45,7 @@ retry 20 resolve_dev || die "$BOOTDEV not found"
 
 mkdir -p /mnt /sysroot
 mount "$DEV" /mnt || die "mount $DEV failed"
-BASE="/mnt/deploy/$slot"
+BASE="/mnt/deploy/$deploy"
 
 # --- composefs root ------------------------------------------------------------
 # composefs needs a real loop device and there's no udev here to make one;
@@ -58,6 +58,7 @@ mount.composefs "$BASE/root.cfs" /sysroot -o basedir=/mnt/deploy/shared/objects 
 # --- writable state (mount /var before the /etc overlay) -----------------------
 mount -t btrfs -o subvol=@var  "$DEV" /sysroot/var  || die "var mount failed"
 mount -t btrfs -o subvol=@home "$DEV" /sysroot/home || die "home mount failed"
+mount -t btrfs -o subvol=@deploy "$DEV" /sysroot/deploy || die "home mount failed"
 
 # first boot / factory reset: seed an empty @var from the read-only factory copy
 if [ -z "$(ls -A /sysroot/var 2>/dev/null)" ]; then
