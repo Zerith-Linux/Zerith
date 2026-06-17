@@ -72,13 +72,45 @@ FROM docker.io/artixlinux/artixlinux:base-dinit
 COPY --from=uki-builder /out/zerith.efi /usr/lib/uki/zerith.efi
 COPY zerith-ctl /usr/local/bin/zerith-ctl
 
+# Base Packages
 RUN pacman -Syu --noconfirm \
+    base \
     limine \
     util-linux \
     dinit \
     composefs \
     fuse-overlayfs \
-    podman
+    podman \
+    btrfs-progs \
+    e2fsprogs \
+    dosfstools \
+    efibootmgr \
+    sudo \
+    shadow \
+    iproute2 \
+    iputils \
+    dhcpcd \
+    curl \
+    wget \
+    less \
+    nano \
+    vim \
+    tar \
+    gzip \
+    xz \
+    zstd \
+    unzip \
+    rsync \
+    which \
+    grep \
+    sed \
+    gawk \
+    findutils \
+    procps-ng \
+    pciutils \
+    usbutils \
+    kmod \
+    ca-certificates
 
 RUN echo 'root:root' | chpasswd #for debugging purposes
 
