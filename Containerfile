@@ -12,7 +12,7 @@ COPY init /init
 RUN chmod +x /init
 
 RUN pacman -Syu --noconfirm \
-        linux binutils util-linux busybox cpio systemd systemd-ukify composefs kmod zstd
+        linux-zen binutils util-linux busybox cpio systemd systemd-ukify composefs kmod zstd
 
 RUN ls /usr/lib/modules | grep -v '^extramodules' | head -n1 > /kver
 
@@ -70,6 +70,7 @@ RUN KVER="$(cat /kver)"; \
 
 FROM docker.io/artixlinux/artixlinux:base-dinit
 COPY --from=uki-builder /out/zerith.efi /usr/lib/uki/zerith.efi
+COPY zerith-ctl /usr/local/bin/zerith-ctl
 
 RUN pacman -Syu --noconfirm \
     limine \
