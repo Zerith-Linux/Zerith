@@ -146,7 +146,7 @@ jobs:
             rm -f "$mnt/usr/etc/machine-id"
 
             # 4. NOW blank the mutable dirs back to empty mountpoints
-            for d in etc var home dev proc sys run tmp mnt boot deploy; do
+            for d in etc var home dev proc sys run tmp mnt efi deploy; do
                 rm -rf "$mnt/$d"
                 mkdir -p "$mnt/$d"
             done

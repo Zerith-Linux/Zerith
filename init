@@ -60,7 +60,7 @@ mount.composefs "$BASE/root.cfs" /sysroot -o basedir=/mnt/@deploy/shared/objects
 EFIDEV="$(findfs LABEL=efi-zerith 2>/dev/null)"
 [ -n "$EFIDEV" ] && [ -b "$EFIDEV" ] || die "EFI partition not found"
 
-mount -t vfat "$EFIDEV" /sysroot/boot || die "EFI mount failed"
+mount -t vfat "$EFIDEV" /sysroot/efi || die "EFI mount failed"
 
 # --- writable state (mount /var before the /etc overlay) -----------------------
 mount -t btrfs -o subvol=@var  "$DEV" /sysroot/var  || die "var mount failed"
