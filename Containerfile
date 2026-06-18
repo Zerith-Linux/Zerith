@@ -141,8 +141,8 @@ RUN dinitctl -o enable NetworkManager && \
     dinitctl -o enable dbus && \
     dinitctl -o enable sddm
 
-RUN sed -i 's|^Exec=.*|Exec=mango -s "qs -c caelestia"|' \
-    /usr/share/wayland-sessions/mango.desktop
+RUN sed -i 's|^Exec=.*|Exec=bash -c "mango -s '\''qs -c caelestia'\'' > /dev/null 2>\&1"|' \
+    /usr/share/wayland-sessions/mango.desktop && cat /usr/share/wayland-sessions/mango.desktop
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
