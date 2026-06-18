@@ -138,7 +138,7 @@ RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN dinitctl -o enable NetworkManager && \
     dinitctl -o enable dbus && \
-    dinitctl -o disable getty1
+    dinitctl -o disable getty@tty1
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
