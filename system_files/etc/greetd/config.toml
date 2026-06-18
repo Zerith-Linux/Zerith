@@ -1,3 +1,0 @@
-[default_session]
-command = "/usr/bin/noctalia-greeter-session"
-user = "greeter"
