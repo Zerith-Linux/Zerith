@@ -74,6 +74,7 @@ FROM docker.io/artixlinux/artixlinux:base-dinit
 COPY --from=uki-builder /out/zerith.efi /usr/lib/uki/zerith.efi
 COPY --from=uki-builder /out/modules /usr/lib/modules
 COPY zerith-ctl /usr/local/bin/zerith-ctl
+COPY system_files /
 
 # Base Packages
 RUN pacman -Syu --noconfirm \
@@ -137,7 +138,8 @@ RUN useradd -m -G wheel aur && \
 RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN dinitctl -o enable NetworkManager && \
-    dinitctl -o enable dbus
+    dinitctl -o enable dbus && \
+    dinitctl -o enable greetd
 
 RUN sed -i 's#/dev/tty\[1-6\]#/dev/tty[2-6]#' /etc/dinit.d/config/console.conf
 
