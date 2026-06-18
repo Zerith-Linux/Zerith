@@ -74,7 +74,7 @@ FROM docker.io/artixlinux/artixlinux:base-dinit
 COPY --from=uki-builder /out/zerith.efi /usr/lib/uki/zerith.efi
 COPY --from=uki-builder /out/modules /usr/lib/modules
 COPY zerith-ctl /usr/local/bin/zerith-ctl
-COPY system_files /
+# COPY system_files /
 
 # Base Packages
 RUN pacman -Syu --noconfirm \
