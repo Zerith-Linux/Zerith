@@ -74,7 +74,7 @@ FROM docker.io/artixlinux/artixlinux:base-dinit
 COPY --from=uki-builder /out/zerith.efi /usr/lib/uki/zerith.efi
 COPY --from=uki-builder /out/modules /usr/lib/modules
 COPY zerith-ctl /usr/local/bin/zerith-ctl
-# COPY system_files /
+COPY system_files /
 
 # Base Packages
 RUN pacman -Syu --noconfirm \
@@ -86,8 +86,6 @@ RUN pacman -Syu --noconfirm \
     dinit \
     dbus \
     dbus-dinit \
-    sddm \
-    sddm-dinit \
     networkmanager-dinit \
     shadow \
     sudo \
@@ -129,7 +127,7 @@ RUN pacman -Syu --noconfirm \
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     su aur -c "cd /home/aur && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm" && \
-    su aur -c "yay -S --noconfirm mangowm caelestia-shell-mango-git caelestia-sddm-minimalist-git" && \
+    su aur -c "yay -S --noconfirm mangowm vibepanel-bin veila-bin" && \
     pacman -Rs --noconfirm base-devel && \
     pacman -Scc --noconfirm && \
     userdel -r aur && \
@@ -138,11 +136,7 @@ RUN useradd -m -G wheel aur && \
 RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN dinitctl -o enable NetworkManager && \
-    dinitctl -o enable dbus && \
-    dinitctl -o enable sddm
-
-RUN sed -i 's|^Exec=.*|Exec=bash -c "mango -s '\''qs -c caelestia'\''"|' \
-    /usr/share/wayland-sessions/mango.desktop && cat /usr/share/wayland-sessions/mango.desktop
+    dinitctl -o enable dbus
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
