@@ -147,6 +147,6 @@ RUN mkdir -p /usr/etc/dinit.d && \
 RUN mkdir -p /usr/lib/tmpfiles.d && \
     printf 'd /var/log/dinit 0755 root root -\n' > /usr/lib/tmpfiles.d/zerith-dinit.conf
 
-RUN echo "LIBSEAT_BACKEND=seatd" >> /etc/environment
+RUN echo "LIBSEAT_BACKEND=logind" >> /etc/environment
 
 RUN rm -rf /usr/lib/systemd /etc/systemd /var/lib/systemd
