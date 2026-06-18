@@ -122,7 +122,8 @@ RUN pacman -Syu --noconfirm \
     less \
     nano \
     vim \
-    btop
+    btop \
+    awww
 
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
