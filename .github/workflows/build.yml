@@ -150,6 +150,8 @@ jobs:
       - name: Render composefs + build/sign UKI
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
+          # Secure Boot signing key/cert (PEM). Optional during bring-up: if
+          # unset, the UKI is left UNSIGNED and a loud warning is printed.
           SB_KEY: ${{ secrets.SB_KEY }}
           SB_CERT: ${{ secrets.SB_CERT }}
         run: |
@@ -212,25 +214,53 @@ jobs:
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "${{ github.token }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # ---- 6. Write per-deployment metadata -----------------------------------
-      - name: Write deployment.json
+      # ---- 6. Write per-deployment metadata (+ pack object shards) ------------
+      # Packs one deterministic tar per prefix dir and records each shard's blob
+      # digest (sha256 of the tar bytes == the OCI descriptor digest oras assigns)
+      # into object_shards. Clients diff this map to fetch only changed shards.
+      - name: Write deployment.json + pack object shards
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
           VERSION: ${{ steps.meta.outputs.version }}
+          DEPLOYED_AT: ${{ steps.meta.outputs.date }}
         run: |
           set -e
           OBJ_REF="${IMAGE_REGISTRY}/${IMAGE_NAME}-objects:${DEPLOY_ID}"
           DIGEST=$(cat out/composefs.digest)
-          cat > out/deployment.json <<EOF
-          {
-            "schema": 1,
-            "deploy_id": "${DEPLOY_ID}",
-            "version": "${VERSION}",
-            "composefs_digest": "${DIGEST}",
-            "objects_ref": "${OBJ_REF}",
-            "deployed_at": "${{ steps.meta.outputs.date }}"
-          }
-          EOF
+
+          # Deterministic tar per prefix dir (sorted, zeroed metadata) so an
+          # unchanged prefix yields a byte-identical blob -> identical digest.
+          mkdir -p out/shards
+          ( cd out/objects && for d in */; do
+              d="${d%/}"
+              tar --sort=name --mtime='@0' --owner=0 --group=0 \
+                  --numeric-owner --format=ustar \
+                  -cf "../shards/${d}.tar" "$d"
+            done )
+
+          # prefix -> "sha256:<hex>"
+          : > /tmp/shardmap
+          for f in out/shards/*.tar; do
+            [ -e "$f" ] || continue
+            pfx="$(basename "$f" .tar)"
+            sum="$(sha256sum "$f" | awk '{print $1}')"
+            printf '%s sha256:%s\n' "$pfx" "$sum" >> /tmp/shardmap
+          done
+          SHARDS_JSON="$(jq -Rn '[inputs|split(" ")|{(.[0]):.[1]}]|add // {}' < /tmp/shardmap)"
+
+          jq -n \
+            --arg deploy_id "$DEPLOY_ID" \
+            --arg version "$VERSION" \
+            --arg digest "$DIGEST" \
+            --arg objects_ref "$OBJ_REF" \
+            --arg deployed_at "$DEPLOYED_AT" \
+            --argjson shards "$SHARDS_JSON" \
+            '{schema:1, deploy_id:$deploy_id, version:$version,
+              composefs_digest:$digest, objects_ref:$objects_ref,
+              object_shards:$shards, deployed_at:$deployed_at}' \
+            > out/deployment.json
+
+          echo "object shards: $(jq '.object_shards|length' out/deployment.json)"
           {
             echo "OBJ_REF=${OBJ_REF}"
             echo "DEPLOY_REF_ID=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEPLOY_ID}"
@@ -239,35 +269,26 @@ jobs:
 
       # ---- 7. Push the OCI artifacts via oras ---------------------------------
       # Deployment artifact = UKI + root.cfs + deployment.json (unique per build).
-      # Objects = the content store packed into ONE deterministic tar per 2-hex
-      # prefix dir, pushed as one blob each (a few hundred uploads instead of one
-      # per object — the per-object push was the 40-min timeout). Deterministic
-      # tars (sorted, zeroed mtime/owner) dedup at the registry across builds, so
-      # an unchanged prefix re-uses its existing blob.
+      # Objects = the prefix tar shards packed in step 6, one blob each (titled by
+      # basename so a full-pull fallback lands them flat). Deterministic tars
+      # dedup at the registry, so unchanged prefixes re-use their existing blob.
       - name: Push deployment + objects
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: |
           set -e
-          cd out
 
-          oras push "$DEPLOY_REF_ID" \
-            --artifact-type application/vnd.zerith.deployment+json \
-            deployment.json:application/vnd.zerith.deployment.config+json \
-            zerith.efi:application/vnd.zerith.uki \
-            root.cfs:application/vnd.zerith.composefs.image+erofs
+          ( cd out && oras push "$DEPLOY_REF_ID" \
+              --artifact-type application/vnd.zerith.deployment+json \
+              deployment.json:application/vnd.zerith.deployment.config+json \
+              zerith.efi:application/vnd.zerith.uki \
+              root.cfs:application/vnd.zerith.composefs.image+erofs )
           # Move the channel tag to this build.
           oras tag "$DEPLOY_REF_ID" "${TAG_PREFIX}${DEFAULT_TAG}"
 
-          # Pack one deterministic tar per prefix dir.
-          mkdir -p shards
-          ( cd objects && for d in */; do
-              d="${d%/}"
-              tar --sort=name --mtime='@0' --owner=0 --group=0 \
-                  --numeric-owner --format=ustar \
-                  -cf "../shards/${d}.tar" "$d"
-            done )
+          # Push the shards (cwd = out/shards so each layer title is "<pfx>.tar").
+          cd out/shards
           args=()
-          for f in shards/*.tar; do
+          for f in *.tar; do
             [ -e "$f" ] || continue
             args+=( "${f}:application/vnd.zerith.objects.shard.tar" )
           done

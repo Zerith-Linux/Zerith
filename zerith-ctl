@@ -186,13 +186,15 @@ def clear_role(deploy: Path, role: str) -> None:
 
 
 def write_meta(ddir: Path, *, deploy_id: str, version: str,
-               digest: str, objects_ref: str | None, ref: str | None) -> None:
+               digest: str, objects_ref: str | None, object_shards: dict,
+               ref: str | None) -> None:
     meta = {
         "schema": META_SCHEMA,
         "deploy_id": deploy_id,
         "version": version,
         "composefs_digest": digest,
         "objects_ref": objects_ref,
+        "object_shards": object_shards,
         "ref": ref,
         "deployed_at": now(),
     }
@@ -209,7 +211,10 @@ def load_meta(deploy: Path, deploy_id: str | None) -> dict:
     if not deploy_id:
         return {}
     try:
-        return json.loads((deploy_dir(deploy, deploy_id) / "deployment.json").read_text())
+        return json.loads(
+            (deploy_dir(deploy,
+                        deploy_id) / "deployment.json"
+             ).read_text())
     except (OSError, ValueError):
         return {}
 
@@ -312,6 +317,10 @@ class Source:
     def objects_ref(self) -> str | None:
         return self.meta.get("objects_ref")
 
+    @property
+    def object_shards(self) -> dict:
+        return self.meta.get("object_shards", {}) or {}
+
     def cleanup(self) -> None:
         if self._cleanup:
             self._cleanup()
@@ -361,46 +370,104 @@ def place_object(tmp: Path, shared: Path, rel: str) -> bool:
 _OBJ_PATH_RE = re.compile(r"^[0-9a-f]{2}/[0-9a-f]{2,}$")
 
 
-def land_objects_from_ref(objects_ref: str, shared: Path) -> None:
-    """Download the objects artifact (deterministic per-prefix tar shards) and
-    extract any objects we don't already have, verifying each one's fs-verity
-    digest against its store path and sealing it. One blob per shard keeps the
-    transfer small; per-object dedup still happens at extract time on disk."""
-    require_tool("oras")
+def ref_repo(ref: str) -> str:
+    """Strip the tag/digest from an OCI ref, leaving registry/repo (for
+    `oras blob fetch repo@digest`). A colon is a tag separator only in the final
+    path segment, so a registry port (host:5000/repo) is handled correctly."""
+    at = ref.split("@", 1)[0]
+    slash = at.rfind("/")
+    last = at[slash + 1:]
+    if ":" in last:
+        return at[:slash + 1] + last.split(":", 1)[0]
+    return at
+
+
+def _extract_shard(tar_path: Path, shared: Path) -> tuple[int, int]:
+    """Extract one shard tar into the shared store, skipping objects already
+    present and verifying + sealing each new one. Returns (new, already-present)."""
+    new = present = 0
+    with tarfile.open(tar_path) as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            rel = (m.name[len("objects/"):]
+                   if m.name.startswith("objects/") else m.name)
+            if not _OBJ_PATH_RE.match(rel):
+                continue                       # not an object path; ignore
+            dest = shared / rel
+            if dest.exists():
+                present += 1
+                continue
+            if DRY_RUN:
+                log(f"[dry-run] extract object {rel}")
+                continue
+            extracted = tf.extractfile(m)
+            if extracted is None:
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
+            with open(tmp, "wb") as out:
+                shutil.copyfileobj(extracted, out)
+            if place_object(tmp, shared, rel):
+                new += 1
+            else:
+                present += 1
+    return new, present
+
+
+def _land_full(objects_ref: str, shared: Path) -> None:
+    """Pull the whole objects artifact and extract every shard. Used when no
+    shard digest map is available to diff against."""
     staging = Path(tempfile.mkdtemp(prefix="zerith-obj-"))
     try:
         run(["oras", "pull", objects_ref, "-o", str(staging)])
-        fetched = present = 0
-        for tarpath in sorted(staging.glob("*.tar")):
-            with tarfile.open(tarpath) as tf:
-                for m in tf.getmembers():
-                    if not m.isfile():
-                        continue
-                    rel = (m.name[len("objects/"):]
-                           if m.name.startswith("objects/") else m.name)
-                    if not _OBJ_PATH_RE.match(rel):
-                        continue            # not an object path; ignore
-                    dest = shared / rel
-                    if dest.exists():
-                        present += 1
-                        continue
-                    if DRY_RUN:
-                        log(f"[dry-run] extract object {rel}")
-                        continue
-                    extracted = tf.extractfile(m)
-                    if extracted is None:
-                        continue
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
-                    with open(tmp, "wb") as out:
-                        shutil.copyfileobj(extracted, out)
-                    if place_object(tmp, shared, rel):
-                        fetched += 1
-                    else:
-                        present += 1
+        new = present = 0
+        for tarpath in sorted(staging.rglob("*.tar")):
+            a, b = _extract_shard(tarpath, shared)
+            new += a
+            present += b
+        log(f"objects: extracted {new} new, {
+            present} already present (full pull)")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    log(f"objects: extracted {fetched} new, {present} already present")
+
+
+def land_objects_from_ref(objects_ref: str, shared: Path,
+                          new_shards: dict | None = None,
+                          old_shards: dict | None = None) -> None:
+    """Materialize this deployment's objects into the shared store, fetching only
+    the shards whose digest changed vs the current deployment. A prefix whose
+    digest matches the current deployment is already on disk (held by it), so
+    it's skipped on the wire. With no map (older artifact / no current), pull the
+    whole artifact."""
+    require_tool("oras")
+    new_shards = new_shards or {}
+    old_shards = old_shards or {}
+    if not (new_shards and old_shards):
+        _land_full(objects_ref, shared)
+        return
+
+    repo = ref_repo(objects_ref)
+    staging = Path(tempfile.mkdtemp(prefix="zerith-obj-"))
+    try:
+        changed = new = present = 0
+        for pfx, digest in sorted(new_shards.items()):
+            if old_shards.get(pfx) == digest:
+                continue                       # bucket unchanged; already on disk
+            changed += 1
+            if DRY_RUN:
+                log(f"[dry-run] oras blob fetch {repo}@{digest} ({pfx})")
+                continue
+            tar_path = staging / f"{pfx}.tar"
+            run(["oras", "blob", "fetch", f"{repo}@{digest}",
+                 "--output", str(tar_path)])
+            a, b = _extract_shard(tar_path, shared)
+            new += a
+            present += b
+        log(f"objects: {changed} changed shard(s) of {len(new_shards)}; "
+            f"extracted {new} new, {present} already present")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def referenced_objects(root_cfs: Path) -> set[str]:
@@ -458,7 +525,14 @@ def stage(deploy: Path, src: Source) -> None:
             ddir.mkdir(parents=True, exist_ok=True)
 
         # 1. Land this image's objects into the shared store (verify + seal).
-        land_objects_from_ref(src.objects_ref, shared)
+        #    Diff against the current deployment's shard map so we fetch only the
+        #    prefix buckets that actually changed; unchanged ones are already on
+        #    disk (held by the current deployment).
+        cur_id = read_role(deploy, "current")
+        old_shards = load_meta(deploy, cur_id).get(
+            "object_shards", {}) if cur_id else {}
+        land_objects_from_ref(src.objects_ref, shared,
+                              src.object_shards, old_shards)
 
         # 2. Place + seal root.cfs, then verify against the signed digest.
         if DRY_RUN:
@@ -485,7 +559,8 @@ def stage(deploy: Path, src: Source) -> None:
             shutil.copy2(src.uki, btrfs_uki)
 
         write_meta(ddir, deploy_id=src.deploy_id, version=src.version,
-                   digest=src.digest, objects_ref=src.objects_ref, ref=src.ref)
+                   digest=src.digest, objects_ref=src.objects_ref,
+                   object_shards=src.object_shards, ref=src.ref)
 
     set_role(deploy, "staging", src.deploy_id)
 
