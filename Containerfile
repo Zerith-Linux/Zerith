@@ -114,8 +114,6 @@ RUN pacman -Syu --noconfirm \
     zstd \
     git \
     less \
-    nano \
-    vim \
     nvim \
     emacs \
     btop \
