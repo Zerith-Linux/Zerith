@@ -235,30 +235,50 @@ jobs:
           OBJ_REF="${IMAGE_REGISTRY}/${IMAGE_NAME}-objects:${DEPLOY_ID}"
           DIGEST=$(cat out/composefs.digest)
 
+          # Deterministic tar per object-prefix (sorted, zeroed metadata) so an
+          # unchanged prefix yields a byte-identical blob -> identical digest.
+          #
+          # SHARD_HEX = how many leading hex chars of an object's digest name a
+          # shard. composefs lays objects out as objects/<2hex>/<62hex>, so the
+          # full digest is dir+filename. 2 -> 256 shards, 3 -> 4096, 4 -> 65536.
+          # The re-pull fraction on a small change is roughly
+          #   changed_objects / shard_count
+          # so finer prefixes slash re-downloads (256 buckets meant any update
+          # touching >256 files re-pulled ~everything). The cost is more blobs
+          # in the objects artifact: one tar + one OCI layer per occupied
+          # prefix. At 4-hex on a full rootfs that is tens of thousands of
+          # layers -> slow push, big manifest. If oras push or the registry
+          # chokes, drop this to 3 (one line) -- it keeps ~99% of the benefit.
           SHARD_HEX=3
-          mkdir -p out/shards /tmp/groups
+          mkdir -p out/shards
           ( cd out/objects
-            # Bucket every object by the first $SHARD_HEX hex chars of its digest.
-            # Sort first so the grouping awk only ever holds ONE file handle open
-            # (it closes the previous group when the prefix rolls over) -- avoids
-            # the "too many open files" blowup at tens of thousands of buckets.
-            # relpath stays "<2hex>/<rest>" so the client extractor is unchanged.
+            # Bucket every object by the first $SHARD_HEX hex chars of its digest
+            # and emit "prefix<TAB>relpath", sorted by prefix. relpath stays
+            # "<2hex>/<rest>" so the client extractor is unchanged. 'NF' drops any
+            # blank line so a stray empty record can't poison the grouping.
             find . -type f | sed 's|^\./||' \
-              | awk -v n="$SHARD_HEX" '{ h=$0; gsub("/","",h);
-                                        print substr(h,1,n) "\t" $0 }' \
-              | LC_ALL=C sort \
-              | awk -F'\t' '
-                  $1!=cur { if (cur!="") close(out); cur=$1; out="/tmp/groups/" $1 }
-                  { print $2 >> out }
-                  END { if (cur!="") close(out) }'
-            # One deterministic tar per occupied prefix.
-            for g in /tmp/groups/*; do
-              [ -e "$g" ] || continue
-              pfx="$(basename "$g")"
+              | awk -v n="$SHARD_HEX" 'NF { h=$0; gsub("/","",h);
+                                           print substr(h,1,n) "\t" $0 }' \
+              | LC_ALL=C sort > /tmp/shardlines
+
+            # Walk the sorted list and flush one deterministic tar each time the
+            # prefix rolls over. Because the input is sorted we only ever hold
+            # one group in hand, so this scales to tens of thousands of buckets
+            # without dynamic awk redirections or an FD blowup. Reading from a
+            # file (not a pipe) keeps $cur in this shell so the final flush works.
+            flush() {
+              [ -n "$cur" ] || return 0
               tar --sort=name --mtime='@0' --owner=0 --group=0 \
                   --numeric-owner --format=ustar \
-                  -cf "../shards/${pfx}.tar" -T "$g"
-            done )
+                  -cf "../shards/${cur}.tar" -T /tmp/group
+            }
+            cur=""; : > /tmp/group
+            while IFS="$(printf '\t')" read -r pfx rel; do
+              [ -n "$pfx" ] || continue
+              if [ "$pfx" != "$cur" ]; then flush; cur="$pfx"; : > /tmp/group; fi
+              printf '%s\n' "$rel" >> /tmp/group
+            done < /tmp/shardlines
+            flush )
           echo "packed $(ls out/shards | wc -l) shard(s) at ${SHARD_HEX}-hex prefix"
 
           # prefix -> "sha256:<hex>"
