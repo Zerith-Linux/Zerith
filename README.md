@@ -1,6 +1,6 @@
 # Zerith
 
-An immutable, image-based Linux distribution built on Artix, with a composefs
+An immutable, image-based Linux OS built on Artix, with a composefs
 read-only root, role-based deployments with an N-1 fallback, and a true
 factory-reset model.
 
@@ -79,7 +79,7 @@ The deep dives live in [`docs/`](docs/):
 
 ## Status
 
-Zerith is an in-development, experimental distribution; expect rough edges. The
+Zerith is an in-development, experimental OS; expect rough edges. The
 core mechanics — composefs root, digest-pinned UKI/Limine boot, signed `oras` /
 `cosign` delivery, role-based deployments with an N-1 fallback, the install →
 `zerithctl` lifecycle, writable subvolumes, and factory reset — are the working
