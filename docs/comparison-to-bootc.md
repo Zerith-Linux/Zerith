@@ -38,21 +38,26 @@ Both use composefs for the read-only root, but the enforcement model differs:
 
 | | Zerith | bootc (composefs + sealed) |
 |---|---|---|
-| composefs usage | Always required — boot fails if the digest doesn't match | Optional (`enabled = true` / `verity` / `false`) |
-| Digest anchor | Embedded in the UKI's signed kernel cmdline (`composefs.digest=`) | Same in sealed-image mode |
-| Per-object fs-verity | **Every backing object** is fs-verity-sealed; the kernel refuses to open a file whose backing data doesn't match its recorded digest | Applied to the composefs image file itself (the `.img`); per-object fs-verity via `trusted.overlay.metacopy` xattrs when `enabled = verity` |
-| Kernel enforcement | At file-open time (the kernel checks the fs-verity Merkle tree on read) | On composefs mount (the digest must match), or per-file via xattrs in verity mode |
+| composefs usage | Always required — boot fails if the digest doesn't match | **Enabled by default**; what's configurable is the integrity level, not whether composefs is used (`composefs.enabled` in `prepare-root.conf` takes `yes` / `no` / `maybe` / `signed` / `verity`; base images default to composefs-on without backing-object verification) |
+| Digest anchor | Embedded in the UKI's signed kernel cmdline (`composefs.digest=`) | Same idea in sealed-image mode — the composefs digest is embedded in the signed UKI cmdline as `composefs=<sha512>` |
+| Per-object integrity | **Every backing object** is fs-verity-sealed; the kernel refuses to open a file whose backing data doesn't match its recorded digest | In `verity`/`signed` mode, before a file's content is read its backing object in `/ostree/repo/objects` is validated against the digest recorded in the composefs metadata image; `signed` additionally requires an ed25519 signature over that composefs digest |
+| Enforcement point | At file-open time (the kernel checks the fs-verity Merkle tree on read) | At mount the composefs digest must match; in `verity`/`signed` mode backing objects are also validated per-file before their content is read |
 
 In practice both produce a signed chain from UEFI → bootloader → UKI →
-composefs digest → file content. Zerith requires per-object fs-verity
-unconditionally; bootc makes composefs and verity configurable.
+composefs digest → file content. The difference is narrower than it looks:
+Zerith requires per-object fs-verity unconditionally, while bootc enables
+composefs by default and lets you choose the integrity level — `yes` (no
+backing-object verification), `verity` (fs-verity-checked backing objects), or
+`signed` (verity plus an ed25519 signature over the composefs digest). In
+`verity`/`signed` mode bootc does the same per-object, read-time validation
+Zerith does; the base-image default just doesn't turn it on.
 
 ## Update transport and storage
 
 | | Zerith | bootc |
 |---|---|---|
 | Object format | Pack blob + offset index (two OCI blobs) | OCI layers unpacked into an ostree content-addressed repo |
-| Delta mechanism | **HTTP Range fetches** — only the byte ranges covering changed objects are downloaded, coalesced into a handful of requests | Whole OCI layer download. `rpm-ostree build-chunked-oci` can split the image into smaller layers so a single-file change touches only one smaller layer |
+| Delta mechanism | **HTTP Range fetches** — only the byte ranges covering changed objects are downloaded, coalesced into a handful of requests | Whole OCI layer download. Chunked-OCI tooling (e.g. `rpm-ostree compose build-chunked-oci`) can split the image into smaller layers so a single-file change touches only one smaller layer |
 | Granularity | Single byte range (one changed file → its exact bytes in the pack) | Compressed OCI layer tarball (a changed file redownloads the entire layer it belongs to) |
 | Fresh install | Range coalesces into a single whole-pack Range request | All OCI layers are pulled |
 | Registry deduplication | Byte-identical pack → same blob digest → automatic | Layer-level (depends on compressed layer content) |
@@ -74,15 +79,23 @@ across the filesystem, this difference matters.
 Functionally equivalent. Both use hardlinks so removing a deployment frees
 only the objects unique to it.
 
+> Note: the bootc rows above describe the current default **ostree** backend.
+> bootc is actively developing a **composefs-native** backend (composefs-rs,
+> no ostree) — compiled in but experimental and not production-ready as of this
+> writing. Some of the ostree-specific details here will change as that lands.
+
 ## Supply chain and signing
 
 | | Zerith | bootc |
 |---|---|---|
-| Artifact signing | **cosign** (sigstore, keyless OIDC) — the deployment.json + UKI + Limine + root.cfs is verified before landing | cosign/sigstore at the registry level, inherited from the container runtime (podman), not built into bootc itself |
-| Object signing | None needed — integrity anchored by the signed UKI digest and per-file fs-verity | Same — ostree content-addressing + composefs digest replaces per-object signatures |
-| Signing key | Your own UEFI Secure Boot key enrolled in firmware | Microsoft-signed shim + your MOK or distro key |
+| Artifact signing | **cosign** (sigstore, keyless OIDC) — the deployment.json + UKI + Limine + root.cfs is verified before landing | cosign/sigstore enforced via bootc's container-image signature policy at pull time; in sealed-image mode the UKI is additionally signed with your own Secure Boot key |
+| Object signing | None needed — integrity anchored by the signed UKI digest and per-file fs-verity | Same — ostree content-addressing + composefs digest replaces per-object signatures; the composefs digest can itself be ed25519-signed (`signed` mode) |
+| Signing key | Your own UEFI Secure Boot key enrolled in firmware | GRUB path: Microsoft-signed shim + your MOK or distro key. Sealed/systemd-boot path: your own Secure Boot key enrolled in firmware, same as Zerith |
 
-Same trust model — just different key enrollment paths.
+Same trust model. The key-enrollment path differs by bootloader: bootc's
+default GRUB+shim path leans on the Microsoft-signed shim so it boots without
+enrolling a custom key, while its sealed/systemd-boot path enrolls your own
+Secure Boot key — the same approach Zerith takes.
 
 ---
 
@@ -102,7 +115,7 @@ The table below shows where each choice lands:
 | Shim requirement | No (enroll your own key) | Yes (works on locked firmware) |
 | Update bandwidth | Proportional to changed bytes | Proportional to changed layers |
 | Init surface | Smaller (dinit) | Larger (systemd) |
-| composefs enforcement | Always, per-object fs-verity | Configurable, variable depth |
+| composefs enforcement | Always, per-object fs-verity | Composefs on by default; integrity level (none / verity / signed) configurable |
 | Hardware support | Rolling your own | Broad, distribution-tested |
 | Operational maturity | Experimental | Production (Fedora IoT/CoreOS) |
 
