@@ -307,18 +307,18 @@ def _fetch_range(registry: str, repo_path: str, blob_digest: str,
     return out_path
 
 
-def _place_from_buffer(buf_path: Path, objs: list, shared: Path) -> tuple[int, int]:
+def _place_from_buffer(buf_path: Path, objs: list, shared: Path) -> int:
     """Slice each object out of a fetched buffer (a range, or the whole pack),
     verify + seal it, and place it in the shared store. Seeks per object so a big
     buffer never sits in memory all at once. Offsets are relative to the buffer.
+    Returns how many objects were newly placed.
     """
-    new = present = 0
+    new = 0
     with open(buf_path, "rb") as buf:
         for rel_off, length, digest in objs:
             rel = _rel_for_digest(digest)
             dest = shared / rel
             if dest.exists():
-                present += 1
                 continue
             buf.seek(rel_off)
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -327,23 +327,24 @@ def _place_from_buffer(buf_path: Path, objs: list, shared: Path) -> tuple[int, i
                 out.write(buf.read(length))
             if place_object(tmp, shared, rel):
                 new += 1
-            else:
-                present += 1
-    return new, present
+    return new
 
 
 def _missing_objects(src, shared: Path,
                      index: dict[str, tuple[int, int]]
-                     ) -> tuple[list[tuple[int, int, str]], int]:
-    """From this image's referenced objects, return ``(want, inlined)`` where
-    ``want`` is the ``(offset, length, digest)`` list (sorted by offset) for
-    objects we lack, and ``inlined`` counts referenced objects absent from the
-    index because composefs inlined their payload into the image itself.
+                     ) -> tuple[list[tuple[int, int, str]], int, int]:
+    """From this image's referenced objects, return ``(want, inlined, present)``
+    where ``want`` is the ``(offset, length, digest)`` list (sorted by offset)
+    for objects we lack, ``inlined`` counts referenced objects absent from the
+    index because composefs inlined their payload into the image itself, and
+    ``present`` counts objects already in the shared store.
     """
     want: list[tuple[int, int, str]] = []
     inlined = 0
+    present = 0
     for rel in referenced_objects(src.root_cfs):
         if (shared / rel).exists():
+            present += 1
             continue
         digest = rel.replace("/", "")
         entry = index.get(digest)
@@ -352,7 +353,7 @@ def _missing_objects(src, shared: Path,
             continue
         want.append((entry[0], entry[1], digest))
     want.sort()
-    return want, inlined
+    return want, inlined, present
 
 
 def land_from_pack(src, shared: Path) -> None:
@@ -376,19 +377,20 @@ def land_from_pack(src, shared: Path) -> None:
     pack_digest = src.objects_pack["digest"]
 
     index = _fetch_index(repo, src.objects_index)
-    want, inlined = _missing_objects(src, shared, index)
+    want, inlined, already_present = _missing_objects(src, shared, index)
     if inlined:
         vlog(f"objects: {inlined} referenced object(s) inlined in image, "
              f"nothing to fetch for them")
     if not want:
-        log("objects: all present, nothing to fetch")
+        log(f"objects: all {already_present} present, nothing to fetch")
         return
 
-    _land_pack_by_range(repo, pack_digest, want, shared)
+    _land_pack_by_range(repo, pack_digest, want, shared, already_present)
 
 
 def _land_pack_by_range(repo: str, pack_digest: str,
-                        want: list[tuple[int, int, str]], shared: Path) -> None:
+                        want: list[tuple[int, int, str]], shared: Path,
+                        already_present: int) -> None:
     """Fetch only the byte ranges covering missing objects via HTTP Range."""
     require_tool("curl")
     ranges = _coalesce_ranges(want, config.COALESCE_GAP)
@@ -403,7 +405,7 @@ def _land_pack_by_range(repo: str, pack_digest: str,
     registry, repo_path = repo.split("/", 1)
     staging = Path(tempfile.mkdtemp(prefix="zerith-pack-"))
     try:
-        new = present = 0
+        new = 0
         jobs = max(1, min(config.FETCH_JOBS, len(ranges)))
         prog = Progress(len(ranges), label="objects")
         with ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -416,15 +418,15 @@ def _land_pack_by_range(repo: str, pack_digest: str,
             for fut in as_completed(futures):
                 buf_path = fut.result()         # re-raises fetch failure
                 start, end, objs = futures[fut]
-                a, b = _place_from_buffer(buf_path, objs, shared)
-                new += a
-                present += b
+                new += _place_from_buffer(buf_path, objs, shared)
                 buf_path.unlink(missing_ok=True)
                 prog.update(end - start + 1)
+        total = already_present + new
         prog.finish(
-            f"objects: {new} fetched, {present} already present "
-            f"({len(want)} needed via {len(ranges)} range request(s), "
-            f"{jobs}-way); {human_bytes(prog.nbytes)} in {prog.elapsed:.1f}s "
+            f"objects: {already_present} already present, "
+            f"{new} fetched ({total} needed via {len(ranges)} range "
+            f"request(s), {jobs}-way); {human_bytes(prog.nbytes)} "
+            f"in {prog.elapsed:.1f}s "
             f"({human_bytes(prog.nbytes / prog.elapsed)}/s)")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
