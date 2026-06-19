@@ -281,15 +281,18 @@ jobs:
             flush )
           echo "packed $(ls out/shards | wc -l) shard(s) at ${SHARD_HEX}-hex prefix"
 
-          # prefix -> "sha256:<hex>"
-          : > /tmp/shardmap
-          for f in out/shards/*.tar; do
-            [ -e "$f" ] || continue
-            pfx="$(basename "$f" .tar)"
-            sum="$(sha256sum "$f" | awk '{print $1}')"
-            printf '%s sha256:%s\n' "$pfx" "$sum" >> /tmp/shardmap
-          done
-          SHARDS_JSON="$(jq -Rn '[inputs|split(" ")|{(.[0]):.[1]}]|add // {}' < /tmp/shardmap)"
+          # prefix -> "sha256:<hex>", one sha256sum pass over all shards (cd in
+          # so the printed name is "<pfx>.tar", not "out/shards/<pfx>.tar").
+          ( cd out/shards && sha256sum *.tar ) \
+            | awk '{ p=$2; sub(/\.tar$/,"",p); print p " sha256:" $1 }' \
+            > /tmp/shardmap
+
+          # Materialize the map to a file. It must NOT ride the command line: a
+          # single argv string is capped at 128 KiB (MAX_ARG_STRLEN), and the
+          # full shard object blows past that well before 4096 shards. The final
+          # jq pulls it in with --slurpfile instead of --argjson.
+          jq -Rn '[inputs|split(" ")|{(.[0]):.[1]}]|add // {}' \
+            < /tmp/shardmap > /tmp/shards.json
 
           jq -n \
             --arg deploy_id "$DEPLOY_ID" \
@@ -297,10 +300,10 @@ jobs:
             --arg digest "$DIGEST" \
             --arg objects_ref "$OBJ_REF" \
             --arg deployed_at "$DEPLOYED_AT" \
-            --argjson shards "$SHARDS_JSON" \
+            --slurpfile shards /tmp/shards.json \
             '{schema:1, deploy_id:$deploy_id, version:$version,
               composefs_digest:$digest, objects_ref:$objects_ref,
-              object_shards:$shards, deployed_at:$deployed_at}' \
+              object_shards:($shards[0]), deployed_at:$deployed_at}' \
             > out/deployment.json
 
           echo "object shards: $(jq '.object_shards|length' out/deployment.json)"
