@@ -92,7 +92,7 @@ jobs:
 
       - name: Post-process rootfs
         run: |
-          set -e
+          set -E
           buildah unshare bash -c '
             set -e
             ctr=$(buildah from containers-storage:localhost/${{ env.IMAGE_NAME }}:localbuild)
@@ -132,7 +132,7 @@ jobs:
 
       - name: Export rootfs
         run: |
-          set -e
+          set -E
           mkdir -p rootfs
           cid=$(podman create localhost/post-processed)
           podman export "$cid" | sudo tar -x -C rootfs
