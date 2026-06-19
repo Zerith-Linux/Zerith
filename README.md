@@ -4,7 +4,7 @@ An immutable, image-based Linux distribution built on Artix, with a composefs
 read-only root, role-based deployments with an N-1 fallback, and a true
 factory-reset model.
 
-**No Bootc here ;P** — but Zerith is definitely inspired by bootc.
+**Architectural note vs. bootc.** bootc uses GRUB+shim or systemd-boot with OCI layer-based updates; Zerith uses a pinned, signed Limine loader and byte-level HTTP Range fetches from a pack blob. bootc uses systemd as PID 1 (with systemd-sysupdate); Zerith uses dinit. Both use composefs for the read-only root, cosign-signed OCI artifacts, and content-addressed object stores — the core image-based update idea is the same, with different choices in the boot chain and init.
 
 ---
 
