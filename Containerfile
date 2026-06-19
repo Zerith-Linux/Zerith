@@ -66,6 +66,7 @@ FROM docker.io/artixlinux/artixlinux:base-dinit
 
 COPY --from=uki-builder /out/initramfs.img /usr/lib/zerith/initramfs.img
 COPY --from=uki-builder /out/modules /usr/lib/modules
+
 # Host tooling: the zerith package lands on the import path at
 # /usr/lib/zerith, and the zerithctl shim (which adds that dir to
 # sys.path) goes on PATH. See docs/host-tooling.md.
@@ -118,6 +119,7 @@ RUN pacman -Syu --noconfirm \
     zstd \
     git \
     less \
+    vim \
     nvim \
     emacs \
     btop \
