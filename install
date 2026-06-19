@@ -285,34 +285,45 @@ def land_objects_from_dir(src_objects: Path, shared: Path) -> None:
     vlog(f"landed {count} new object(s) from {src_objects}")
 
 
-def land_objects_from_ref(objects_ref: str, shared: Path) -> None:
-    """Fetch only the objects we don't already have from an oras objects artifact."""
+def land_objects_from_ref(objects_ref: str, shared: Path, parts: int) -> None:
+    """Fetch only the objects we don't already have from the objects artifact.
+
+    The object set is sharded across `parts` artifacts tagged <objects_ref>-partN
+    (CI splits them so no single OCI manifest exceeds the registry's ~4 MiB
+    limit). We fetch each shard's manifest and union the layers; blobs already in
+    the shared store are skipped, so an update only pulls the genuinely new ones.
+    """
     require_tool("oras")
     repo = ref_repo(objects_ref)
-    manifest = json.loads(run(["oras", "manifest", "fetch", objects_ref],
-                              capture=True) or "{}")
-    layers = manifest.get("layers", [])
-    fetched = 0
-    for layer in layers:
-        title = layer.get("annotations", {}).get(
-            "org.opencontainers.image.title", "")
-        if not title:
-            continue
-        rel = title[len("objects/"):] if title.startswith("objects/") else title
-        dest = shared / rel
-        if dest.exists():
-            continue
-        if DRY_RUN:
-            log(f"[dry-run] oras blob fetch {repo}@{layer['digest']} -> {rel}")
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
-        run(["oras", "blob", "fetch", f"{repo}@{layer['digest']}",
-             "--output", str(tmp)])
-        if place_object(tmp, shared, rel):
-            fetched += 1
-    log(f"objects: fetched {fetched} new, "
-        f"{len(layers) - fetched} already present")
+    fetched = total = 0
+    for i in range(max(parts, 1)):
+        part_ref = f"{objects_ref}-part{i}"
+        manifest = json.loads(run(["oras", "manifest", "fetch", part_ref],
+                                  capture=True) or "{}")
+        layers = manifest.get("layers", [])
+        total += len(layers)
+        for layer in layers:
+            title = layer.get("annotations", {}).get(
+                "org.opencontainers.image.title", "")
+            if not title:
+                continue
+            rel = title[len("objects/")
+                            :] if title.startswith("objects/") else title
+            dest = shared / rel
+            if dest.exists():
+                continue
+            if DRY_RUN:
+                log(f"[dry-run] oras blob fetch {
+                    repo}@{layer['digest']} -> {rel}")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
+            run(["oras", "blob", "fetch", f"{repo}@{layer['digest']}",
+                 "--output", str(tmp)])
+            if place_object(tmp, shared, rel):
+                fetched += 1
+    log(f"objects: fetched {fetched} new, {total - fetched} already present "
+        f"(across {max(parts, 1)} shard(s))")
 
 
 # --------------------------------------------------------------------------- #
@@ -349,6 +360,10 @@ class Source:
     @property
     def digest(self) -> str:
         return self.meta["composefs_digest"]
+
+    @property
+    def objects_parts(self) -> int:
+        return int(self.meta.get("objects_parts", 1))
 
     def cleanup(self) -> None:
         if self._cleanup:
@@ -406,6 +421,7 @@ def write_deployment_meta(deploy_dir: Path, src: Source) -> None:
         "version": src.version,
         "composefs_digest": src.digest,
         "objects_ref": src.objects_ref,
+        "objects_parts": src.objects_parts,
         "ref": src.ref,
         "deployed_at": now(),
     }
@@ -596,7 +612,7 @@ def deploy(sysroot: Path, efi: Path, src: Source) -> None:
     if src.local_objects is not None:
         land_objects_from_dir(src.local_objects, shared)
     elif src.objects_ref:
-        land_objects_from_ref(src.objects_ref, shared)
+        land_objects_from_ref(src.objects_ref, shared, src.objects_parts)
     else:
         die("no object source (neither local objects/ nor objects_ref)")
 

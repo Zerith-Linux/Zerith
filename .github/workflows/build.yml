@@ -21,6 +21,10 @@ env:
   IMAGE_NAME: "${{ github.event.repository.name }}"
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
   DEFAULT_TAG: "latest"
+  # Objects are sharded into artifacts of this many blobs each, so no single OCI
+  # manifest exceeds the registry's ~4 MiB limit (~300 B/descriptor -> stay well
+  # under it). install/zerith-ctl read objects_parts from deployment.json.
+  OBJ_BATCH: "5000"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.brand_name}}-${{ inputs.stream_name }}
@@ -78,6 +82,7 @@ jobs:
         id: deploy_id
         run: echo "id=${GITHUB_SHA:0:8}$(openssl rand -hex 4)" >> "$GITHUB_OUTPUT"
 
+      # ---- 1. Build the rootfs image (no UKI inside it any more) --------------
       - name: Build Image
         id: build_image
         uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2
@@ -90,6 +95,7 @@ jobs:
             DEPLOY_ID=${{ steps.deploy_id.outputs.id }}
           oci: false
 
+      # ---- 2. Post-process the rootfs (immutable layout: /usr/etc, factory var)
       - name: Post-process rootfs
         run: |
           set -e
@@ -130,6 +136,7 @@ jobs:
             buildah rm "$ctr"
           '
 
+      # ---- 3. Export the post-processed rootfs to a plain directory -----------
       - name: Export rootfs
         run: |
           set -e
@@ -138,9 +145,12 @@ jobs:
           podman export "$cid" | sudo tar -x -C rootfs
           podman rm "$cid"
 
+      # ---- 4. Render composefs, pin its digest, build + sign the UKI ----------
       - name: Render composefs + build/sign UKI
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
+          # Secure Boot signing key/cert (PEM). Optional during bring-up: if
+          # unset, the UKI is left UNSIGNED and a loud warning is printed.
           SB_KEY: ${{ secrets.SB_KEY }}
           SB_CERT: ${{ secrets.SB_CERT }}
         run: |
@@ -153,14 +163,18 @@ jobs:
             docker.io/archlinux:base bash -euo pipefail -c '
               pacman -Sy --noconfirm composefs fsverity-utils systemd-ukify sbsigntools >/dev/null
 
+              # 4a. Render the read-only image + content-addressed object store.
               mkdir -p /out/objects
               mkcomposefs --digest-store=/out/objects /rootfs /out/root.cfs
 
+              # 4b. Compute the image fs-verity digest (offline; no kernel verity).
+              #     Format is "sha256:<hex> <file>"; keep the bare hex.
               DIGEST=$(fsverity digest /out/root.cfs | awk "{print \$1}" | sed "s/^sha256://")
               [ -n "$DIGEST" ] || { echo "FATAL: empty composefs digest" >&2; exit 1; }
               echo "$DIGEST" > /out/composefs.digest
               echo "composefs.digest=$DIGEST"
 
+              # 4c. Build the UKI with the digest baked into the signed cmdline.
               KVER=$(ls /rootfs/usr/lib/modules | grep -v "^extramodules" | head -n1)
               ukify build \
                 --linux="/rootfs/usr/lib/modules/$KVER/vmlinuz" \
@@ -169,6 +183,7 @@ jobs:
                 --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
                 --output=/out/zerith.efi
 
+              # 4d. Secure Boot sign the UKI (gated on a key being provided).
               if [ -n "$SB_KEY" ] && [ -n "$SB_CERT" ]; then
                 printf "%s" "$SB_KEY"  > /tmp/sb.key
                 printf "%s" "$SB_CERT" > /tmp/sb.crt
@@ -181,8 +196,12 @@ jobs:
                 echo "::warning::SB_KEY/SB_CERT not set — UKI is UNSIGNED. Secure Boot will reject it."
               fi
             '
+          # /out is root-owned (rendered as root); hand it back to the runner so
+          # the later unprivileged push/sign steps can read it.
           sudo chown -R "$(id -u):$(id -g)" out
 
+      # ---- 5. Tooling for push + sign -----------------------------------------
+      # TODO: pin these to commit SHAs to match the rest of the workflow.
       - name: Install oras
         uses: oras-project/setup-oras@v1
       - name: Install cosign
@@ -194,6 +213,7 @@ jobs:
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "${{ github.token }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      # ---- 6. Write per-deployment metadata (incl. object shard count) --------
       - name: Write deployment.json
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
@@ -202,6 +222,9 @@ jobs:
           set -e
           OBJ_REF="${IMAGE_REGISTRY}/${IMAGE_NAME}-objects:${DEPLOY_ID}"
           DIGEST=$(cat out/composefs.digest)
+          TOTAL=$(find out/objects -type f | wc -l)
+          PARTS=$(( (TOTAL + OBJ_BATCH - 1) / OBJ_BATCH ))
+          [ "$PARTS" -lt 1 ] && PARTS=1
           cat > out/deployment.json <<EOF
           {
             "schema": 1,
@@ -209,15 +232,18 @@ jobs:
             "version": "${VERSION}",
             "composefs_digest": "${DIGEST}",
             "objects_ref": "${OBJ_REF}",
+            "objects_parts": ${PARTS},
             "deployed_at": "${{ steps.meta.outputs.date }}"
           }
           EOF
+          echo "objects: ${TOTAL} file(s) -> ${PARTS} shard(s)"
           {
             echo "OBJ_REF=${OBJ_REF}"
             echo "DEPLOY_REF_ID=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEPLOY_ID}"
             echo "DEPLOY_REF_CHANNEL=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEFAULT_TAG}"
           } >> "$GITHUB_ENV"
 
+      # ---- 7. Push the OCI artifacts via oras ---------------------------------
       - name: Push deployment + objects
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: |
@@ -232,13 +258,27 @@ jobs:
           # Move the channel tag to this build.
           oras tag "$DEPLOY_REF_ID" "${TAG_PREFIX}${DEFAULT_TAG}"
 
-          # Objects: NB very large images can exceed ARG_MAX here; if so, batch
-          # the find output with xargs into repeated `oras push --no-tty` calls.
-          find objects -type f -printf '%p:application/octet-stream\n' > /tmp/objlist
-          oras push "$OBJ_REF" \
-            --artifact-type application/vnd.zerith.objects \
-            $(cat /tmp/objlist)
+          # Objects, sharded. Build each batch's arg list as a bash array (no
+          # word-splitting, no ARG_MAX blow-up) and push one artifact per shard.
+          mapfile -t allobjs < <(find objects -type f -print)
+          total=${#allobjs[@]}
+          batch="${OBJ_BATCH:-5000}"
+          part=0
+          i=0
+          while [ "$i" -lt "$total" ]; do
+            args=()
+            for f in "${allobjs[@]:i:batch}"; do
+              args+=( "${f}:application/octet-stream" )
+            done
+            oras push "${OBJ_REF}-part${part}" \
+              --artifact-type application/vnd.zerith.objects \
+              "${args[@]}"
+            part=$(( part + 1 ))
+            i=$(( i + batch ))
+          done
+          echo "pushed ${part} object shard(s)"
 
+      # ---- 8. Sign the deployment artifact (keyless, OIDC) --------------------
       - name: Cosign sign
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
@@ -246,4 +286,3 @@ jobs:
         run: |
           set -e
           cosign sign "$DEPLOY_REF_ID"
-          cosign sign "$OBJ_REF"

@@ -184,13 +184,15 @@ def clear_role(deploy: Path, role: str) -> None:
 
 
 def write_meta(ddir: Path, *, deploy_id: str, version: str,
-               digest: str, objects_ref: str | None, ref: str | None) -> None:
+               digest: str, objects_ref: str | None, objects_parts: int,
+               ref: str | None) -> None:
     meta = {
         "schema": META_SCHEMA,
         "deploy_id": deploy_id,
         "version": version,
         "composefs_digest": digest,
         "objects_ref": objects_ref,
+        "objects_parts": objects_parts,
         "ref": ref,
         "deployed_at": now(),
     }
@@ -319,6 +321,10 @@ class Source:
     def objects_ref(self) -> str | None:
         return self.meta.get("objects_ref")
 
+    @property
+    def objects_parts(self) -> int:
+        return int(self.meta.get("objects_parts", 1))
+
     def cleanup(self) -> None:
         if self._cleanup:
             self._cleanup()
@@ -366,34 +372,44 @@ def place_object(tmp: Path, shared: Path, rel: str) -> bool:
     return True
 
 
-def land_objects_from_ref(objects_ref: str, shared: Path) -> None:
-    """Fetch only the objects we don't already have from an oras objects artifact."""
+def land_objects_from_ref(objects_ref: str, shared: Path, parts: int) -> None:
+    """Fetch only the objects we don't already have from the objects artifact.
+
+    The set is sharded across <objects_ref>-partN artifacts (CI splits them so no
+    single OCI manifest exceeds the registry's ~4 MiB limit). Fetch each shard's
+    manifest, union the layers, and pull only blobs missing from the shared store.
+    """
     require_tool("oras")
     repo = ref_repo(objects_ref)
-    manifest = json.loads(run(["oras", "manifest", "fetch", objects_ref],
-                              capture=True) or "{}")
-    layers = manifest.get("layers", [])
-    fetched = 0
-    for layer in layers:
-        title = layer.get("annotations", {}).get(
-            "org.opencontainers.image.title", "")
-        if not title:
-            continue
-        rel = title[len("objects/"):] if title.startswith("objects/") else title
-        dest = shared / rel
-        if dest.exists():
-            continue
-        if DRY_RUN:
-            log(f"[dry-run] oras blob fetch {repo}@{layer['digest']} -> {rel}")
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
-        run(["oras", "blob", "fetch", f"{repo}@{layer['digest']}",
-             "--output", str(tmp)])
-        if place_object(tmp, shared, rel):
-            fetched += 1
-    log(f"objects: fetched {fetched} new, "
-        f"{len(layers) - fetched} already present")
+    fetched = total = 0
+    for i in range(max(parts, 1)):
+        part_ref = f"{objects_ref}-part{i}"
+        manifest = json.loads(run(["oras", "manifest", "fetch", part_ref],
+                                  capture=True) or "{}")
+        layers = manifest.get("layers", [])
+        total += len(layers)
+        for layer in layers:
+            title = layer.get("annotations", {}).get(
+                "org.opencontainers.image.title", "")
+            if not title:
+                continue
+            rel = title[len("objects/")
+                            :] if title.startswith("objects/") else title
+            dest = shared / rel
+            if dest.exists():
+                continue
+            if DRY_RUN:
+                log(f"[dry-run] oras blob fetch {
+                    repo}@{layer['digest']} -> {rel}")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
+            run(["oras", "blob", "fetch", f"{repo}@{layer['digest']}",
+                 "--output", str(tmp)])
+            if place_object(tmp, shared, rel):
+                fetched += 1
+    log(f"objects: fetched {fetched} new, {total - fetched} already present "
+        f"(across {max(parts, 1)} shard(s))")
 
 
 def referenced_objects(root_cfs: Path) -> set[str]:
@@ -451,7 +467,7 @@ def stage(deploy: Path, src: Source) -> None:
             ddir.mkdir(parents=True, exist_ok=True)
 
         # 1. Land this image's objects into the shared store (verify + seal).
-        land_objects_from_ref(src.objects_ref, shared)
+        land_objects_from_ref(src.objects_ref, shared, src.objects_parts)
 
         # 2. Place + seal root.cfs, then verify against the signed digest.
         if DRY_RUN:
@@ -478,7 +494,8 @@ def stage(deploy: Path, src: Source) -> None:
             shutil.copy2(src.uki, btrfs_uki)
 
         write_meta(ddir, deploy_id=src.deploy_id, version=src.version,
-                   digest=src.digest, objects_ref=src.objects_ref, ref=src.ref)
+                   digest=src.digest, objects_ref=src.objects_ref,
+                   objects_parts=src.objects_parts, ref=src.ref)
 
     set_role(deploy, "staging", src.deploy_id)
 
@@ -539,67 +556,48 @@ def rollback(deploy: Path, esp: Path) -> None:
     log(f"rolled back: current is now {fb} (was {cur})")
 
 
-def _protected_ids(deploy: Path) -> set[str | None]:
-    ids = {read_role(deploy, r) for r in ROLES}
-    ids.discard(None)
-    return ids
-
-
-def _is_deployment_dir(p: Path) -> bool:
-    return (p.is_dir()
-            and not p.is_symlink()
-            and p.name != "shared"
-            and not p.name.startswith("."))
-
-
-def _remove_unreferenced_deployments(deploy: Path,
-                                     protected: set[str | None]
-                                     ) -> list[str]:
-    removed: list[str] = []
+def _collect_stale(deploy: Path) -> list[Path]:
+    """Deployment dirs eligible for removal: real dirs, not 'shared', not a
+    dotfile, and not currently targeted by a role symlink."""
+    protected = {read_role(deploy, r) for r in ROLES}
+    protected.discard(None)
+    stale = []
     for p in sorted(deploy.iterdir()):
-        if not _is_deployment_dir(p) or p.name in protected:
+        if p.is_symlink() or not p.is_dir():
             continue
-        removed.append(p.name)
-        if DRY_RUN:
-            log(f"[dry-run] rm -rf {p}")
-        else:
-            shutil.rmtree(p)
-            vlog(f"removed deployment {p.name}")
-    return removed
+        if p.name == "shared" or p.name.startswith(".") or p.name in protected:
+            continue
+        stale.append(p)
+    return stale
 
 
-def _unlink_orphan_objects(shared: Path) -> int:
-    """Unlink objects whose only link is the store itself (no holder references)."""
+def _try(fn) -> None:
+    """Run a filesystem op, ignoring races/permission noise."""
+    try:
+        fn()
+    except OSError:
+        pass
+
+
+def _sweep_objects(shared: Path) -> int:
+    """Unlink objects with no remaining holder (link count == 1), then prune the
+    now-empty fanout dirs. Returns how many objects were removed."""
+    if not shared.is_dir():
+        return 0
     swept = 0
     for root, _, files in os.walk(shared):
         for name in files:
             fp = Path(root) / name
             try:
-                if fp.stat().st_nlink == 1:
-                    fp.unlink()
-                    swept += 1
+                orphan = fp.stat().st_nlink == 1
             except OSError:
-                pass
-    return swept
-
-
-def _prune_empty_dirs(top: Path) -> None:
-    for root, dirs, _ in os.walk(top, topdown=False):
+                continue
+            if orphan:
+                _try(fp.unlink)
+                swept += 1
+    for root, dirs, _ in os.walk(shared, topdown=False):
         for d in dirs:
-            try:
-                (Path(root) / d).rmdir()
-            except OSError:
-                pass
-
-
-def _sweep_orphan_objects(shared: Path) -> int:
-    if DRY_RUN:
-        log(f"[dry-run] sweep orphaned objects in {shared} (link count == 1)")
-        return 0
-    if not shared.is_dir():
-        return 0
-    swept = _unlink_orphan_objects(shared)
-    _prune_empty_dirs(shared)
+            _try((Path(root) / d).rmdir)
     return swept
 
 
@@ -610,21 +608,32 @@ def gc(deploy: Path) -> None:
     deployments has link count 1 + K, so count == 1 means no holder references
     it any more.
     """
-    protected = _protected_ids(deploy)
-    removed = _remove_unreferenced_deployments(deploy, protected)
-    swept = _sweep_orphan_objects(deploy / "shared" / "objects")
+    shared = deploy / "shared" / "objects"
+    stale = _collect_stale(deploy)
 
-    if removed:
+    for p in stale:
+        if DRY_RUN:
+            log(f"[dry-run] rm -rf {p}")
+        else:
+            shutil.rmtree(p)
+            vlog(f"removed deployment {p.name}")
+
+    if DRY_RUN:
+        log(f"[dry-run] sweep orphaned objects in {shared} (link count == 1)")
+        return
+
+    swept = _sweep_objects(shared)
+    if stale:
         extra = f"; {swept} orphan object(s)" if swept else ""
-        log(f"gc: removed {len(removed)} deployment(s): "
-            f"{', '.join(removed)}{extra}")
+        log(f"gc: removed {len(stale)} deployment(s): "
+            f"{', '.join(p.name for p in stale)}{extra}")
     else:
         vlog("gc: nothing to remove")
+
 
 # --------------------------------------------------------------------------- #
 # Status
 # --------------------------------------------------------------------------- #
-
 
 def status(deploy: Path, config: Path) -> None:
     print(f"channel   {read_source(config) or '(unset — run deploy REF)'}")
