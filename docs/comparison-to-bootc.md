@@ -26,7 +26,7 @@ UEFI key.
 | PID 1 | **dinit** (~15 KLOC C++) | **systemd** (~1.4 MLOC) |
 | Initramfs | Custom `init` (busybox sh + applets) | systemd in the initramfs |
 | Service supervision | Per-service `run` files, single-threaded, no D-Bus | Full service manager, journal, udev, logind, tmpfiles, socket activation |
-| Update mechanism | Standalone `zerithctl` binary | systemd-sysupdate (part of systemd) |
+| Update mechanism | Standalone `zerithctl` binary | bootc |
 
 systemd is the practical choice for broad hardware support (udev, logind,
 initramfs features). dinit is smaller and simpler but requires manual
