@@ -20,8 +20,9 @@ runtime is confined to a small, well-defined set of writable areas. Updates are
 be rolled back to the previous known-good state.
 
 It is built from OCI container images, rendered to composefs and packed into a
-**signed** Unified Kernel Image (UKI) in CI, then delivered as signed OCI
-artifacts and booted by Limine under UEFI.
+**signed** Unified Kernel Image (UKI) in CI, then delivered as OCI artifacts —
+gated by `cosign` and fs-verity — and booted by a Secure Boot-signed Limine
+under UEFI.
 
 ## Why Zerith?
 
@@ -69,8 +70,9 @@ core really needs — that's the point of Zerith.
 - **Reproducible builds** — the OS is produced by a container build pipeline,
   so an image is a deterministic artifact you can rebuild and inspect.
 - **Verified end to end** — the composefs digest is pinned in the Secure
-  Boot-signed UKI and enforced at mount by fs-verity, and update artifacts are
-  signed and checked before they ever touch disk.
+  Boot-signed UKI and enforced at mount by fs-verity; the bootable deployment
+  artifact is `cosign`-signed, and every object is verified against the signed
+  composefs digest before it is trusted.
 - **Recoverable by design** — a clean factory copy of `/var` ships inside the
   image, so the machine can always be reset to defaults.
 
@@ -84,8 +86,9 @@ core really needs — that's the point of Zerith.
 UEFI firmware → Limine (ESP) → zerith.efi (UKI) → initramfs → composefs root → switch_root → dinit
 ```
 
-1. **Limine (UEFI)** loads the selected deployment's Unified Kernel Image from the
-   EFI System Partition.
+1. **Limine (UEFI)** loads the selected deployment's Unified Kernel Image from
+   the EFI System Partition. Limine itself is Secure Boot-signed with the same
+   key as the UKI, so the firmware validates it before it runs.
 2. The **UKI (`zerith.efi`)** bundles the kernel and a minimal busybox
    initramfs; it is assembled with `ukify` and signed for Secure Boot.
 3. The **initramfs** loads the required modules, mounts the composefs root
@@ -125,8 +128,14 @@ Disk (`/dev/sdx`), GPT:
 
 | Partition | Type        | Filesystem | Purpose                                          |
 |-----------|-------------|------------|--------------------------------------------------|
-| `sdx1`    | EFI System  | FAT32      | Limine + role-named UKIs (`/zerith/current.efi`, `/zerith/fallback.efi`) |
+| `sdx1`    | EFI System  | FAT32      | Limine (`/EFI/BOOT/BOOTX64.EFI`), `limine.conf`, and role-named UKIs (`/zerith/current.efi`, `/zerith/fallback.efi`) |
 | `sdx2`    | Linux       | btrfs      | composefs images, object store, writable state   |
+
+Limine is installed to the removable-media fallback path
+(`/EFI/BOOT/BOOTX64.EFI`) so it boots in any firmware without relying on an
+NVRAM entry — it survives firmware resets and board swaps, and boots unmodified
+in a VM. A labelled `efibootmgr` entry pointing at the same file is added when
+possible, as a best-effort bonus, but the system does not depend on it.
 
 btrfs contents on `sdx2`:
 
@@ -137,8 +146,9 @@ btrfs contents on `sdx2`:
   staging  ─▶ <id>            #   transient, present only during an update
   <id>/root.cfs               #   per-deployment composefs index
   <id>/zerith.efi             #   per-deployment UKI (source for the ESP copy)
+  <id>/BOOTX64.EFI            #   per-deployment signed Limine loader (source for the ESP copy)
   <id>/objects/               #   per-deployment hardlink holder (object GC refcount)
-  <id>/deployment.json        #   self-describing metadata (id / version / digest / objects ref)
+  <id>/deployment.json        #   self-describing metadata (id / version / digest / objects ref / shard digests)
   shared/objects/             #   shared content-addressed object store
   source.conf                 #   update channel (the signed artifact ref `update` pulls)
 @var                          # subvolume → /var   (persistent)
@@ -224,9 +234,9 @@ by the running system and always matches the deployed OS.
 
 ## Build pipeline
 
-Zerith images are produced entirely by CI and delivered as **signed OCI
-artifacts** — the target never renders an image or pulls a container, it only
-verifies and lands prebuilt pieces.
+Zerith images are produced entirely by CI and delivered as OCI artifacts — the
+target never renders an image or pulls a container, it only verifies and lands
+prebuilt pieces.
 
 One subtlety drives the whole shape of this: the composefs image's digest must
 be known *before* the UKI is signed, because that digest is baked into the
@@ -245,27 +255,37 @@ the digest doesn't exist until the final rootfs has been rendered.)
    the runtime overlay), and blank the mutable dirs back to empty mountpoints.
 3. **Render composefs** — `mkcomposefs` produces `root.cfs` and the
    content-addressed object store, and the image's fs-verity digest is computed
-   offline.
-4. **Build + sign the UKI** — `ukify` bundles the kernel + initramfs with
-   `deploy=<id> composefs.digest=<digest>` on the command line, then `sbsign`
-   signs it for Secure Boot. The pinned digest is now part of the signed payload.
+   offline. (This runs as real root so file ownership and modes are recorded
+   faithfully.)
+4. **Build + sign the UKI and Limine** — `ukify` bundles the kernel + initramfs
+   with `deploy=<id> composefs.digest=<digest>` on the command line, then
+   `sbsign` signs both the UKI and the Limine loader for Secure Boot with the
+   same key. The pinned digest is now part of the signed payload.
 5. **Push via `oras`** — two artifacts go to the registry:
-   - a **deployment artifact** (the signed UKI + `root.cfs` + `deployment.json`),
-     unique per build;
-   - an **objects artifact**, one blob per object. The registry deduplicates
-     blobs by content, so unchanged objects aren't re-uploaded and a target only
-     fetches the objects it's missing.
-6. **Sign with `cosign`** — both artifacts are signed (keyless, via the CI
-   OIDC identity), so the host can verify provenance before trusting them.
+   - a **deployment artifact** (the signed UKI, the signed Limine loader,
+     `root.cfs`, and `deployment.json`), unique per build;
+   - an **objects artifact** — the content-addressed object store packed into
+     deterministic tarballs, one per hash-prefix bucket. Identical buckets
+     produce byte-identical blobs, so the registry deduplicates unchanged ones
+     and a build re-uploads only the buckets that changed. `deployment.json`
+     records each shard's digest so the host can fetch just the buckets that
+     differ from what it already has.
+6. **Sign with `cosign`** — the deployment artifact is signed (keyless, via the
+   CI OIDC identity) so the host can verify provenance before trusting it. The
+   objects don't need their own signature: their integrity is already anchored
+   by the signed `root.cfs` digest and per-object fs-verity, so a tampered or
+   swapped object can't satisfy the mount.
 
 **On the host (`install` / `zerith-ctl`):**
 
 7. **Pull + verify** — fetch the deployment artifact with `oras`, verify its
-   `cosign` signature, then fetch only the objects not already present.
+   `cosign` signature, then fetch object shards — skipping any whose digest
+   matches the deployment already installed, so only the changed buckets come
+   down the wire.
 8. **Land + seal** — verify each object's fs-verity digest against its store
    path and enable fs-verity on it; place `root.cfs`, enable fs-verity, and
    confirm its measured digest matches the value signed into the UKI.
-9. **Promote** — install the UKI to the deploy-id directory and the ESP, flip
+9. **Promote** — install the UKI and the signed Limine loader to the ESP, flip
    `current` (demoting the old current to `fallback`), and (on first install)
    seed `source.conf` with the update channel.
 
@@ -279,19 +299,14 @@ one after.
 Each link is checked by the one before it:
 
 ```
-Secure Boot → signed UKI → composefs.digest= (signed cmdline)
+Secure Boot → signed Limine → signed UKI → composefs.digest= (signed cmdline)
    → mount.composefs digest= (root image) → verity (every backing object)
 ```
 
-and, for the update path, `cosign` over the OCI artifacts gates what is ever
-allowed to land on disk. Nothing is rendered on the target, so the digest that
-boots is the same digest that was signed in CI.
-
-> Secure Boot enforcement is only as strong as your key setup: the UKI is
-> signed when you provide signing keys to the build (`SB_KEY` / `SB_CERT`), and
-> the firmware will only honour that signature once the matching certificate is
-> enrolled in its `db`. Without those, builds still work — the UKI just ships
-> unsigned and the chain falls back to the `cosign` + fs-verity guarantees.
+and, for the update path, `cosign` over the deployment artifact gates what is
+ever allowed to land on disk, while each object is verified against the signed
+composefs digest as it's placed. Nothing is rendered on the target, so the
+digest that boots is the same digest that was signed in CI.
 
 ---
 
@@ -309,10 +324,12 @@ so a scheduled `update` and a hand-run `deploy` can't race each other.
 | `rollback` (`swap`)| swap current ⇄ fallback                                             |
 | `gc`               | drop unreferenced deployments and sweep orphaned objects            |
 
-Objects are deduplicated across deployments in `shared/objects`, and each
-deployment keeps a private hardlink "holder" of just the objects it references.
-GC reclaims an object once its link count shows no holder still needs it, so
-removing an old deployment frees only the files unique to it.
+An update fetches only the object shards whose digest differs from the current
+deployment, so a small change pulls only the buckets it touched. Objects are
+deduplicated across deployments in `shared/objects`, and each deployment keeps a
+private hardlink "holder" of just the objects it references. GC reclaims an
+object once its link count shows no holder still needs it, so removing an old
+deployment frees only the files unique to it.
 
 ---
 

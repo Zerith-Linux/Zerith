@@ -248,8 +248,9 @@ def esp_uki(esp: Path, role: str) -> Path:
 
 
 def esp_limine(esp: Path) -> Path:
-    """The Limine loader on the ESP (the efibootmgr entry points here)."""
-    return esp / "EFI" / "zerith-limine" / "BOOTX64.EFI"
+    """The Limine loader on the ESP. We use the removable-media fallback path so
+    it boots without an NVRAM entry; the efibootmgr entry (if any) points here."""
+    return esp / "EFI" / "BOOT" / "BOOTX64.EFI"
 
 
 def atomic_copy(src: Path, dst: Path) -> None:
@@ -432,8 +433,7 @@ def _land_full(objects_ref: str, shared: Path) -> None:
             a, b = _extract_shard(tarpath, shared)
             new += a
             present += b
-        log(f"objects: extracted {new} new, {
-            present} already present (full pull)")
+        log(f"objects: extracted {new} new, {present} already present (full pull)")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -520,7 +520,7 @@ def stage(deploy: Path, src: Source) -> None:
     if not DRY_RUN and not src.uki.is_file():
         die(f"deployment artifact has no {UKI_NAME}")
     if not src.objects_ref:
-        die("deployment metadata has no objects_ref")
+        die(f"deployment metadata has no objects_ref")
 
     if (not DRY_RUN) and root_cfs.exists():
         log(f"deployment {src.deploy_id} already on disk, reusing")
@@ -535,8 +535,7 @@ def stage(deploy: Path, src: Source) -> None:
         #    prefix buckets that actually changed; unchanged ones are already on
         #    disk (held by the current deployment).
         cur_id = read_role(deploy, "current")
-        old_shards = load_meta(deploy, cur_id).get(
-            "object_shards", {}) if cur_id else {}
+        old_shards = load_meta(deploy, cur_id).get("object_shards", {}) if cur_id else {}
         land_objects_from_ref(src.objects_ref, shared,
                               src.object_shards, old_shards)
 
@@ -548,8 +547,7 @@ def stage(deploy: Path, src: Source) -> None:
             enable_verity(root_cfs)
             got = measure_file(root_cfs)
             if got != src.digest:
-                die(f"root.cfs digest mismatch: expected {
-                    src.digest}, got {got}")
+                die(f"root.cfs digest mismatch: expected {src.digest}, got {got}")
             vlog("root.cfs digest verified against signed metadata")
 
         # 3. Holder hardlinks for GC (only this image's objects).
@@ -737,8 +735,7 @@ def do_deploy(deploy: Path, esp: Path, ref: str, cos_id: str | None,
     src = source_from_ref(ref, cos_id, cos_issuer, skip_verify)
     try:
         if src.deploy_id == read_role(deploy, "current"):
-            log(f"already on {src.deploy_id} (version {
-                src.version}); up to date")
+            log(f"already on {src.deploy_id} (version {src.version}); up to date")
             return
         stage(deploy, src)
         promote(deploy, esp, src.deploy_id)
@@ -800,10 +797,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser(
         "update", help="pull the configured channel and promote if it changed")
 
-    sub.add_parser("rollback", aliases=[
-                   "swap"], help="swap current <-> fallback")
-    sub.add_parser(
-        "gc", help="remove unreferenced deployments and orphaned objects")
+    sub.add_parser("rollback", aliases=["swap"], help="swap current <-> fallback")
+    sub.add_parser("gc", help="remove unreferenced deployments and orphaned objects")
 
     args = p.parse_args(argv)
     DRY_RUN = args.dry_run

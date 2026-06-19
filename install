@@ -607,7 +607,11 @@ def install_limine(efi: Path, disk: Path | None = None,
         log(f"warning: Limine EFI loader not found at {limine_src}, skipping")
         return
 
-    dest_dir = efi / "EFI" / "zerith-limine"
+    # Install to the removable-media fallback path: it lives on the disk, so it
+    # boots in any firmware without an NVRAM entry (survives firmware resets,
+    # board swaps, and boots in a VM). Zerith owns the disk, so there's no other
+    # fallback loader to clobber.
+    dest_dir = efi / "EFI" / "BOOT"
     dest_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(limine_src, dest_dir / "BOOTX64.EFI")
     vlog(f"copied Limine loader to {dest_dir / 'BOOTX64.EFI'}")
@@ -625,16 +629,21 @@ def install_limine(efi: Path, disk: Path | None = None,
             if part_num is None:
                 part_num = resolved[1]
 
+    # The loader above already boots via the fallback path. The NVRAM entry
+    # below is a best-effort bonus: a labelled "Zerith Boot Manager" option that
+    # ranks above other fallbacks. If we can't make it (no efivars, no
+    # efibootmgr, can't resolve the disk), the system still boots from the
+    # fallback path — so these are warnings, not failures.
     if disk is None or part_num is None:
-        log("warning: could not determine ESP disk/partition; loader copied but "
-            "no UEFI boot entry created (add one manually with efibootmgr)")
+        log("note: could not resolve ESP disk/partition; booting via the "
+            "fallback path only (no labelled NVRAM entry)")
         return
 
     if not shutil.which("efibootmgr"):
-        log("warning: efibootmgr not found, skipping boot entry creation")
+        log("note: efibootmgr not found; booting via the fallback path only")
         return
     if not os.path.exists("/sys/firmware/efi/efivars"):
-        log("warning: efivars not mounted, skipping boot entry creation")
+        log("note: efivars not mounted; booting via the fallback path only")
         return
 
     if EFI_LABEL in run(["efibootmgr"], capture=True):
@@ -647,7 +656,7 @@ def install_limine(efi: Path, disk: Path | None = None,
         "--disk", str(disk),
         "--part", part_num,
         "--label", EFI_LABEL,
-        "--loader", r"\EFI\zerith-limine\BOOTX64.EFI",
+        "--loader", r"\EFI\BOOT\BOOTX64.EFI",
         "--unicode",
     ])
     log("Limine boot entry created")
