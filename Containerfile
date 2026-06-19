@@ -116,6 +116,8 @@ RUN pacman -Syu --noconfirm \
     less \
     nano \
     vim \
+    nvim \
+    emacs \
     btop \
     awww
 
