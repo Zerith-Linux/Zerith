@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import gzip
 import json
 import os
 import re
@@ -55,7 +56,7 @@ DEFAULT_ESP = Path("/efi")
 SOURCE_CONF_NAME = "source.conf"
 LOCK_NAME = ".zerithctl.lock"
 CONFIG_SCHEMA = 1
-META_SCHEMA = 1
+META_SCHEMA = 2
 ROLES = ("current", "fallback", "staging")
 
 UKI_NAME = "zerith.efi"
@@ -74,6 +75,16 @@ try:
     FETCH_JOBS = max(1, int(os.environ.get("ZERITH_FETCH_JOBS", "8")))
 except ValueError:
     FETCH_JOBS = 8
+
+# When fetching objects off the single pack blob, two objects that sit close
+# together get merged into one HTTP Range request even if a few already-present
+# objects lie between them: paying for a little overlap beats a second round
+# trip. This is the max gap (bytes of in-between data) we'll fold in. Override
+# with ZERITH_COALESCE_GAP. 0 disables coalescing (one request per object run).
+try:
+    COALESCE_GAP = max(0, int(os.environ.get("ZERITH_COALESCE_GAP", str(1 << 20))))
+except ValueError:
+    COALESCE_GAP = 1 << 20
 
 
 # --------------------------------------------------------------------------- #
@@ -197,7 +208,7 @@ def clear_role(deploy: Path, role: str) -> None:
 
 def write_meta(ddir: Path, *, deploy_id: str, version: str,
                digest: str, objects_ref: str | None, object_shards: dict,
-               ref: str | None) -> None:
+               objects_pack: dict, objects_index: dict, ref: str | None) -> None:
     meta = {
         "schema": META_SCHEMA,
         "deploy_id": deploy_id,
@@ -205,6 +216,8 @@ def write_meta(ddir: Path, *, deploy_id: str, version: str,
         "composefs_digest": digest,
         "objects_ref": objects_ref,
         "object_shards": object_shards,
+        "objects_pack": objects_pack,
+        "objects_index": objects_index,
         "ref": ref,
         "deployed_at": now(),
     }
@@ -337,6 +350,16 @@ class Source:
     @property
     def object_shards(self) -> dict:
         return self.meta.get("object_shards", {}) or {}
+
+    @property
+    def objects_pack(self) -> dict:
+        """schema>=2: {digest, size} of the single concatenated pack blob."""
+        return self.meta.get("objects_pack") or {}
+
+    @property
+    def objects_index(self) -> dict:
+        """schema>=2: {digest, size, encoding} of the digest->offset index."""
+        return self.meta.get("objects_index") or {}
 
     def cleanup(self) -> None:
         if self._cleanup:
@@ -591,6 +614,198 @@ def link_holder(shared: Path, holder: Path, root_cfs: Path) -> None:
     vlog(f"holder: linked {linked} object(s) for this deployment")
 
 
+def _registry_auth_header(repo: str) -> str | None:
+    """Anonymous OCI bearer-token dance for pulling blobs from `repo`, returned
+    as an 'Authorization: Bearer ...' header (or None if the registry serves
+    blobs without auth). oras does this internally, but Range requests need raw
+    HTTP, so we replicate just the pull-scope token grab."""
+    registry = repo.split("/", 1)[0]
+    # A bare GET /v2/ answers 401 with a WWW-Authenticate pointing at the realm.
+    hdrs = run(["curl", "-sS", "-o", os.devnull, "-D", "-",
+                f"https://{registry}/v2/"], capture=True)
+    m = re.search(r"(?im)^www-authenticate:\s*bearer\s+(.+)$", hdrs)
+    if not m:
+        return None                                   # no auth needed
+    parms = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
+    realm = parms.get("realm")
+    if not realm:
+        return None
+    qs = (f"service={parms.get('service', registry)}"
+          f"&scope=repository:{repo.split('/', 1)[1]}:pull")
+    try:
+        tok = json.loads(run(["curl", "-fsSL", f"{realm}?{qs}"], capture=True))
+    except ValueError:
+        return None
+    bearer = tok.get("token") or tok.get("access_token")
+    return f"Authorization: Bearer {bearer}" if bearer else None
+
+
+def _fetch_index(repo: str, idx_meta: dict) -> dict:
+    """Pull the (small) pack index blob whole and parse it into
+    {digest_hex: (offset, length)}. One blob, so plain oras — no Range."""
+    digest = idx_meta["digest"]
+    staging = Path(tempfile.mkdtemp(prefix="zerith-idx-"))
+    try:
+        out = staging / "index"
+        run(["oras", "blob", "fetch", f"{repo}@{digest}",
+             "--output", str(out)], capture=True)
+        raw = out.read_bytes()
+        if idx_meta.get("encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        index: dict[str, tuple[int, int]] = {}
+        for line in raw.decode().splitlines():
+            if not line:
+                continue
+            dg, off, ln = line.split()
+            index[dg] = (int(off), int(ln))
+        return index
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _coalesce_ranges(want: list[tuple[int, int, str]],
+                     gap: int) -> list[tuple[int, int, list]]:
+    """want: (offset, length, digest) sorted by offset. Merge entries whose gap
+    to the running range is <= `gap` bytes into one HTTP range, so scattered
+    objects collapse into a handful of requests (and a fresh install, where
+    everything is missing, collapses into a single whole-pack stream). Each
+    returned range carries its objects as (offset_within_range, length, digest).
+    """
+    ranges: list[tuple[int, int, list]] = []
+    cur: tuple[int, int, list] | None = None       # (start, end, objs)
+    for off, ln, dg in want:
+        if cur is None:
+            cur = (off, off + ln - 1, [(0, ln, dg)])
+            continue
+        start, end, objs = cur
+        if off - (end + 1) <= gap:
+            objs.append((off - start, ln, dg))
+            cur = (start, max(end, off + ln - 1), objs)
+        else:
+            ranges.append(cur)
+            cur = (off, off + ln - 1, [(0, ln, dg)])
+    if cur is not None:
+        ranges.append(cur)
+    return ranges
+
+
+def _fetch_range(registry: str, repo_path: str, blob_digest: str,
+                 start: int, end: int, out_path: Path,
+                 auth: str | None) -> Path:
+    """GET one byte range of the pack blob to out_path. Safe in a worker thread
+    (only touches its own file + shells out to curl). curl -L follows GHCR's
+    redirect to backing storage, carrying the Range (auth is dropped on the
+    cross-host hop, which is fine: the storage URL is pre-signed)."""
+    url = f"https://{registry}/v2/{repo_path}/blobs/{blob_digest}"
+    cmd = ["curl", "-fsSL", "--retry", "3", "--retry-delay", "1",
+           "-H", f"Range: bytes={start}-{end}"]
+    if auth:
+        cmd += ["-H", auth]
+    cmd += ["-o", str(out_path), url]
+    run(cmd, capture=True)
+    got, wanted = out_path.stat().st_size, end - start + 1
+    if got != wanted:
+        die(f"range fetch returned {got} bytes, expected {wanted} "
+            f"(registry may not honor Range on {blob_digest})")
+    return out_path
+
+
+def _place_from_range(buf_path: Path, objs: list, shared: Path) -> tuple[int, int]:
+    """Slice each object out of a fetched range buffer, verify + seal it, and
+    place it in the shared store. Seeks per object so a big range never has to
+    sit in memory all at once. place_object re-checks the fs-verity digest, so a
+    wrong slice (bad index/range) is caught here."""
+    new = present = 0
+    with open(buf_path, "rb") as buf:
+        for rel_off, length, dg in objs:
+            rel = f"{dg[:2]}/{dg[2:]}"
+            dest = shared / rel
+            if dest.exists():
+                present += 1
+                continue
+            buf.seek(rel_off)
+            data = buf.read(length)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.parent / f".{dg}.tmp"
+            with open(tmp, "wb") as out:
+                out.write(data)
+            if place_object(tmp, shared, rel):
+                new += 1
+            else:
+                present += 1
+    return new, present
+
+
+def land_objects_from_pack(src: "Source", shared: Path) -> None:
+    """Materialize this image's objects from the single pack blob, fetching only
+    the byte ranges for objects we don't already hold. Missing set comes from
+    the new image's root.cfs (referenced) minus what's on disk."""
+    require_tool("oras")
+    require_tool("curl")
+    require_tool("composefs-info")
+    objects_ref = src.objects_ref
+    if not objects_ref:
+        die("deployment metadata has no objects_ref")
+    repo = ref_repo(objects_ref)
+    pack_digest = src.objects_pack["digest"]
+
+    needed = referenced_objects(src.root_cfs)         # {"ab/cdef…", …}
+    missing = [r for r in needed if not (shared / r).exists()]
+    if not missing:
+        log("objects: all present, nothing to fetch")
+        return
+
+    index = _fetch_index(repo, src.objects_index)
+    want = []
+    for rel in missing:
+        dg = rel.replace("/", "")
+        ent = index.get(dg)
+        if ent is None:
+            die(f"object {dg} referenced by image but absent from pack index")
+        want.append((ent[0], ent[1], dg))
+    want.sort()                                       # by pack offset
+    ranges = _coalesce_ranges(want, COALESCE_GAP)
+    span = sum(e - s + 1 for s, e, _ in ranges)
+
+    if DRY_RUN:
+        log(f"[dry-run] {len(missing)} object(s) via {len(ranges)} range "
+            f"request(s), ~{_human_bytes(span)} from {pack_digest}")
+        return
+
+    auth = _registry_auth_header(repo)
+    registry, repo_path = repo.split("/", 1)
+
+    staging = Path(tempfile.mkdtemp(prefix="zerith-pack-"))
+    try:
+        new = present = 0
+        jobs = max(1, min(FETCH_JOBS, len(ranges)))
+        prog = _Progress(len(ranges), label="objects")
+        # Range GETs run on worker threads (overlapping the wire); slicing +
+        # store writes + the progress bar stay on this thread (single writer).
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futs = {}
+            for i, (s, e, objs) in enumerate(ranges):
+                f = pool.submit(_fetch_range, registry, repo_path, pack_digest,
+                                s, e, staging / f"r{i}", auth)
+                futs[f] = (s, e, objs)
+            for fut in as_completed(futs):
+                buf_path = fut.result()               # re-raises fetch failure
+                s, e, objs = futs[fut]
+                a, b = _place_from_range(buf_path, objs, shared)
+                new += a
+                present += b
+                buf_path.unlink(missing_ok=True)
+                prog.update(e - s + 1)
+        elapsed = max(time.monotonic() - prog.start, 1e-6)
+        prog.finish(
+            f"objects: {new} fetched, {present} already present "
+            f"({len(missing)} needed via {len(ranges)} range request(s), "
+            f"{jobs}-way); {_human_bytes(prog.nbytes)} in {elapsed:.1f}s "
+            f"({_human_bytes(prog.nbytes / elapsed)}/s)")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def stage(deploy: Path, src: Source) -> None:
     """Materialize a deployment on disk and mark it `staging`. Idempotent.
 
@@ -619,14 +834,18 @@ def stage(deploy: Path, src: Source) -> None:
             ddir.mkdir(parents=True, exist_ok=True)
 
         # 1. Land this image's objects into the shared store (verify + seal).
-        #    Diff against the current deployment's shard map so we fetch only the
-        #    prefix buckets that actually changed; unchanged ones are already on
-        #    disk (held by the current deployment).
-        cur_id = read_role(deploy, "current")
-        old_shards = load_meta(deploy, cur_id).get(
-            "object_shards", {}) if cur_id else {}
-        land_objects_from_ref(src.objects_ref, shared,
-                              src.object_shards, old_shards)
+        if src.objects_pack:
+            # schema>=2: one pack blob + index. Fetch only the byte ranges for
+            # objects we don't already hold (derived from this image's root.cfs).
+            land_objects_from_pack(src, shared)
+        else:
+            # Legacy shard layout: diff this image's shard map against the
+            # current deployment's so we fetch only the buckets that changed.
+            cur_id = read_role(deploy, "current")
+            old_shards = load_meta(deploy, cur_id).get(
+                "object_shards", {}) if cur_id else {}
+            land_objects_from_ref(src.objects_ref, shared,
+                                  src.object_shards, old_shards)
 
         # 2. Place + seal root.cfs, then verify against the signed digest.
         if DRY_RUN:
@@ -657,7 +876,9 @@ def stage(deploy: Path, src: Source) -> None:
 
         write_meta(ddir, deploy_id=src.deploy_id, version=src.version,
                    digest=src.digest, objects_ref=src.objects_ref,
-                   object_shards=src.object_shards, ref=src.ref)
+                   object_shards=src.object_shards,
+                   objects_pack=src.objects_pack,
+                   objects_index=src.objects_index, ref=src.ref)
 
     set_role(deploy, "staging", src.deploy_id)
 

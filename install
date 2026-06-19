@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import gzip
 import tarfile
 import tempfile
 from typing import NoReturn
@@ -379,6 +380,56 @@ def land_objects_from_ref(objects_ref: str, shared: Path,
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def land_objects_from_pack(objects_ref: str, pack_meta: dict, idx_meta: dict,
+                           shared: Path) -> None:
+    """schema>=2 object landing: fetch the whole pack blob + its index, then
+    explode every object out of the pack into the shared store (verify + seal
+    each). A first install needs every object, so we stream the one pack blob
+    rather than issuing range requests — that's zerithctl's job for incremental
+    updates. place_object re-checks each fs-verity digest before trusting it."""
+    require_tool("oras")
+    repo = ref_repo(objects_ref)
+    staging = Path(tempfile.mkdtemp(prefix="zerith-pack-"))
+    try:
+        packp = staging / "objects.pack"
+        idxp = staging / "objects.index"
+        if DRY_RUN:
+            log(f"[dry-run] oras blob fetch pack {pack_meta.get('digest')}")
+            log(f"[dry-run] oras blob fetch index {idx_meta.get('digest')}")
+            return
+        run(["oras", "blob", "fetch", f"{repo}@{pack_meta['digest']}",
+             "--output", str(packp)])
+        run(["oras", "blob", "fetch", f"{repo}@{idx_meta['digest']}",
+             "--output", str(idxp)])
+        raw = idxp.read_bytes()
+        if idx_meta.get("encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        new = present = 0
+        with open(packp, "rb") as pack:
+            for line in raw.decode().splitlines():
+                if not line:
+                    continue
+                dg, off, ln = line.split()
+                rel = f"{dg[:2]}/{dg[2:]}"
+                dest = shared / rel
+                if dest.exists():
+                    present += 1
+                    continue
+                pack.seek(int(off))
+                data = pack.read(int(ln))
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dest.parent / f".{dg}.tmp"
+                with open(tmp, "wb") as out:
+                    out.write(data)
+                if place_object(tmp, shared, rel):
+                    new += 1
+                else:
+                    present += 1
+        log(f"objects: landed {new} new, {present} already present (pack)")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- #
 # Source resolution (oras artifact OR local CI output dir)
 # --------------------------------------------------------------------------- #
@@ -422,6 +473,16 @@ class Source:
     def object_shards(self) -> dict:
         return self.meta.get("object_shards", {}) or {}
 
+    @property
+    def objects_pack(self) -> dict:
+        """schema>=2: {digest, size} of the single concatenated pack blob."""
+        return self.meta.get("objects_pack") or {}
+
+    @property
+    def objects_index(self) -> dict:
+        """schema>=2: {digest, size, encoding} of the digest->offset index."""
+        return self.meta.get("objects_index") or {}
+
     def cleanup(self) -> None:
         if self._cleanup:
             self._cleanup()
@@ -464,7 +525,7 @@ def source_from_local(local: Path) -> Source:
 # Deployment roles (symlinks) + per-deployment metadata
 # --------------------------------------------------------------------------- #
 
-META_SCHEMA = 1
+META_SCHEMA = 2
 
 
 def deploy_root(sysroot: Path) -> Path:
@@ -479,6 +540,8 @@ def write_deployment_meta(deploy_dir: Path, src: Source) -> None:
         "composefs_digest": src.digest,
         "objects_ref": src.objects_ref,
         "object_shards": src.object_shards,
+        "objects_pack": src.objects_pack,
+        "objects_index": src.objects_index,
         "ref": src.ref,
         "deployed_at": now(),
     }
@@ -685,6 +748,10 @@ def deploy(sysroot: Path, efi: Path, src: Source) -> None:
     # 1. Land objects into the SHARED content-addressed store (verify + seal).
     if src.local_objects is not None:
         land_objects_from_dir(src.local_objects, shared)
+    elif src.objects_ref and src.objects_pack:
+        # schema>=2: one pack blob + index. First install pulls the whole pack.
+        land_objects_from_pack(src.objects_ref, src.objects_pack,
+                               src.objects_index, shared)
     elif src.objects_ref:
         land_objects_from_ref(src.objects_ref, shared, src.object_shards, {})
     else:

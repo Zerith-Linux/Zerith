@@ -221,11 +221,14 @@ jobs:
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "${{ github.token }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # ---- 6. Write per-deployment metadata (+ pack object shards) ------------
-      # Packs one deterministic tar per prefix dir and records each shard's blob
-      # digest (sha256 of the tar bytes == the OCI descriptor digest oras assigns)
-      # into object_shards. Clients diff this map to fetch only changed shards.
-      - name: Write deployment.json + pack object shards
+      # ---- 6. Write per-deployment metadata (+ pack objects into ONE blob) ----
+      # Concatenates every composefs object (sorted by digest) into a single
+      # pack blob and writes an index mapping each object's digest -> its
+      # [offset, length] in the pack. Clients fetch the small index once, work
+      # out which objects they lack (from root.cfs), and pull ONLY those byte
+      # ranges off the pack via HTTP Range requests. One big blob on the
+      # registry; surgical, few-request downloads off it.
+      - name: Write deployment.json + pack objects
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
           VERSION: ${{ steps.meta.outputs.version }}
@@ -235,78 +238,44 @@ jobs:
           OBJ_REF="${IMAGE_REGISTRY}/${IMAGE_NAME}-objects:${DEPLOY_ID}"
           DIGEST=$(cat out/composefs.digest)
 
-          # Deterministic tar per object-prefix (sorted, zeroed metadata) so an
-          # unchanged prefix yields a byte-identical blob -> identical digest.
-          #
-          # SHARD_HEX = how many leading hex chars of an object's digest name a
-          # shard. composefs lays objects out as objects/<2hex>/<62hex>, so the
-          # full digest is dir+filename. 2 -> 256 shards, 3 -> 4096, 4 -> 65536.
-          # The re-pull fraction on a small change is roughly
-          #   changed_objects / shard_count
-          # so finer prefixes slash re-downloads (256 buckets meant any update
-          # touching >256 files re-pulled ~everything). The cost is more blobs
-          # in the objects artifact: one tar + one OCI layer per occupied
-          # prefix. At 4-hex on a full rootfs that is tens of thousands of
-          # layers -> slow push, big manifest. If oras push or the registry
-          # chokes, drop this to 3 (one line) -- it keeps ~99% of the benefit.
-          SHARD_HEX=3
-          mkdir -p out/shards
+          # Sorting by relpath ("ab/cdef") is identical to sorting by digest
+          # (the '/' sits at a fixed position), so the pack order is stable: an
+          # unchanged set of objects yields a byte-identical pack -> identical
+          # blob digest -> the registry dedups the whole push. Build it with a
+          # single xargs|cat (no per-object process spawn) and compute offsets
+          # in one awk pass over the same sorted list, so index and pack agree.
           ( cd out/objects
-            # Bucket every object by the first $SHARD_HEX hex chars of its digest
-            # and emit "prefix<TAB>relpath", sorted by prefix. relpath stays
-            # "<2hex>/<rest>" so the client extractor is unchanged. 'NF' drops any
-            # blank line so a stray empty record can't poison the grouping.
-            find . -type f | sed 's|^\./||' \
-              | awk -v n="$SHARD_HEX" 'NF { h=$0; gsub("/","",h);
-                                           print substr(h,1,n) "\t" $0 }' \
-              | LC_ALL=C sort > /tmp/shardlines
+            find . -type f -printf '%P\t%s\n' | LC_ALL=C sort > /tmp/objs
+            cut -f1 /tmp/objs | tr '\n' '\0' | xargs -0 cat > ../objects.pack
+            awk -F'\t' 'BEGIN{off=0} { d=$1; sub("/","",d); print d, off, $2; off += $2 }' \
+              /tmp/objs > ../objects.index )
+          gzip -9 -f out/objects.index            # -> out/objects.index.gz
 
-            # Walk the sorted list and flush one deterministic tar each time the
-            # prefix rolls over. Because the input is sorted we only ever hold
-            # one group in hand, so this scales to tens of thousands of buckets
-            # without dynamic awk redirections or an FD blowup. Reading from a
-            # file (not a pipe) keeps $cur in this shell so the final flush works.
-            flush() {
-              [ -n "$cur" ] || return 0
-              tar --sort=name --mtime='@0' --owner=0 --group=0 \
-                  --numeric-owner --format=ustar \
-                  -cf "../shards/${cur}.tar" -T /tmp/group
-            }
-            cur=""; : > /tmp/group
-            while IFS="$(printf '\t')" read -r pfx rel; do
-              [ -n "$pfx" ] || continue
-              if [ "$pfx" != "$cur" ]; then flush; cur="$pfx"; : > /tmp/group; fi
-              printf '%s\n' "$rel" >> /tmp/group
-            done < /tmp/shardlines
-            flush )
-          echo "packed $(ls out/shards | wc -l) shard(s) at ${SHARD_HEX}-hex prefix"
+          PACK_DIGEST="sha256:$(sha256sum out/objects.pack | awk '{print $1}')"
+          PACK_SIZE=$(stat -c %s out/objects.pack)
+          IDX_DIGEST="sha256:$(sha256sum out/objects.index.gz | awk '{print $1}')"
+          IDX_SIZE=$(stat -c %s out/objects.index.gz)
+          echo "pack: $(wc -l < /tmp/objs) objects, ${PACK_SIZE} bytes (${PACK_DIGEST})"
 
-          # prefix -> "sha256:<hex>", one sha256sum pass over all shards (cd in
-          # so the printed name is "<pfx>.tar", not "out/shards/<pfx>.tar").
-          ( cd out/shards && sha256sum *.tar ) \
-            | awk '{ p=$2; sub(/\.tar$/,"",p); print p " sha256:" $1 }' \
-            > /tmp/shardmap
-
-          # Materialize the map to a file. It must NOT ride the command line: a
-          # single argv string is capped at 128 KiB (MAX_ARG_STRLEN), and the
-          # full shard object blows past that well before 4096 shards. The final
-          # jq pulls it in with --slurpfile instead of --argjson.
-          jq -Rn '[inputs|split(" ")|{(.[0]):.[1]}]|add // {}' \
-            < /tmp/shardmap > /tmp/shards.json
-
+          # deployment.json records the pack + index blob digests so the client
+          # can address them directly. The deployment artifact is cosign-signed,
+          # so these digests are anchored; objects also self-verify (fs-verity
+          # name == content), so a tampered pack or index can't land.
           jq -n \
             --arg deploy_id "$DEPLOY_ID" \
             --arg version "$VERSION" \
             --arg digest "$DIGEST" \
             --arg objects_ref "$OBJ_REF" \
             --arg deployed_at "$DEPLOYED_AT" \
-            --slurpfile shards /tmp/shards.json \
-            '{schema:1, deploy_id:$deploy_id, version:$version,
+            --arg pack_digest "$PACK_DIGEST" --argjson pack_size "$PACK_SIZE" \
+            --arg idx_digest "$IDX_DIGEST" --argjson idx_size "$IDX_SIZE" \
+            '{schema:2, deploy_id:$deploy_id, version:$version,
               composefs_digest:$digest, objects_ref:$objects_ref,
-              object_shards:($shards[0]), deployed_at:$deployed_at}' \
+              objects_pack:{digest:$pack_digest, size:$pack_size},
+              objects_index:{digest:$idx_digest, size:$idx_size, encoding:"gzip"},
+              deployed_at:$deployed_at}' \
             > out/deployment.json
 
-          echo "object shards: $(jq '.object_shards|length' out/deployment.json)"
           {
             echo "OBJ_REF=${OBJ_REF}"
             echo "DEPLOY_REF_ID=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEPLOY_ID}"
@@ -314,10 +283,10 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # ---- 7. Push the OCI artifacts via oras ---------------------------------
-      # Deployment artifact = UKI + root.cfs + deployment.json (unique per build).
-      # Objects = the prefix tar shards packed in step 6, one blob each (titled by
-      # basename so a full-pull fallback lands them flat). Deterministic tars
-      # dedup at the registry, so unchanged prefixes re-use their existing blob.
+      # Deployment artifact = UKI + root.cfs + deployment.json (unique per build,
+      # cosign-signed). Objects artifact = the pack blob + the gzip index: two
+      # blobs total, so the push is one streamed upload (not thousands of tiny
+      # round-trips). An unchanged pack dedups at the registry by digest.
       - name: Push deployment + objects
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: |
@@ -332,26 +301,11 @@ jobs:
           # Move the channel tag to this build.
           oras tag "$DEPLOY_REF_ID" "${TAG_PREFIX}${DEFAULT_TAG}"
 
-          # Push the shards (cwd = out/shards so each layer title is "<pfx>.tar").
-          cd out/shards
-          args=()
-          for f in *.tar; do
-            [ -e "$f" ] || continue
-            args+=( "${f}:application/vnd.zerith.objects.shard.tar" )
-          done
-          # A single oras push = a single manifest, so every shard rides one
-          # argv. At very high shard counts (fine SHARD_HEX on a big rootfs)
-          # this can exceed ARG_MAX or produce a manifest the registry rejects.
-          # Warn loudly with the remedy rather than dying on a cryptic error.
-          if [ "${#args[@]}" -gt 20000 ]; then
-            echo "::warning::${#args[@]} object shards in one push -- if this" \
-                 "fails on ARG_MAX or a manifest limit, lower SHARD_HEX (e.g. 3)."
-          fi
-          oras push "$OBJ_REF" \
-            --artifact-type application/vnd.zerith.objects \
-            --concurrency 16 \
-            "${args[@]}"
-          echo "pushed ${#args[@]} object shard(s)"
+          ( cd out && oras push "$OBJ_REF" \
+              --artifact-type application/vnd.zerith.objects \
+              objects.pack:application/vnd.zerith.objects.pack \
+              objects.index.gz:application/vnd.zerith.objects.index+gzip )
+          echo "pushed objects pack + index"
 
       # ---- 8. Sign the deployment artifact (keyless, OIDC) --------------------
       # Only the deployment artifact is signed/verified: object integrity is
