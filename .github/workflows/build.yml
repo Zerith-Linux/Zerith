@@ -144,7 +144,7 @@ jobs:
           SB_KEY: ${{ secrets.SB_KEY }}
           SB_CERT: ${{ secrets.SB_CERT }}
         run: |
-          set -e
+          set -E
           mkdir -p out
           sudo podman run --rm \
             -v "$PWD/rootfs:/rootfs:ro" \
