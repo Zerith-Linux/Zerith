@@ -51,7 +51,7 @@ from typing import Generator, NoReturn
 DEFAULT_DEPLOY = Path("/deploy")
 DEFAULT_ESP = Path("/efi")
 SOURCE_CONF_NAME = "source.conf"
-LOCK_NAME = ".zerith-ctl.lock"
+LOCK_NAME = ".zerithctl.lock"
 CONFIG_SCHEMA = 1
 META_SCHEMA = 1
 ROLES = ("current", "fallback", "staging")
@@ -71,7 +71,7 @@ VERBOSE = False
 # --------------------------------------------------------------------------- #
 
 def log(msg: str) -> None:
-    print(f"zerith-ctl: {msg}")
+    print(f"zerithctl: {msg}")
 
 
 def vlog(msg: str) -> None:
@@ -80,7 +80,7 @@ def vlog(msg: str) -> None:
 
 
 def die(msg: str) -> "NoReturn":
-    print(f"zerith-ctl: error: {msg}", file=sys.stderr)
+    print(f"zerithctl: error: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -123,7 +123,7 @@ def deploy_lock(deploy: Path) -> "Generator[None, None, None]":
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            log("another zerith-ctl holds the lock; waiting…")
+            log("another zerithctl holds the lock; waiting…")
             fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -762,7 +762,7 @@ def main(argv: list[str] | None = None) -> int:
     global DRY_RUN, VERBOSE
 
     p = argparse.ArgumentParser(
-        prog="zerith-ctl",
+        prog="zerithctl",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

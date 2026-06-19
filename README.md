@@ -45,7 +45,7 @@ experiment to fill that gap.
   whole-image updates, an N-1 fallback to roll back to, content-addressed
   dedup between deployments, and a true factory reset.
 - **Small and legible.** The whole system is a `Containerfile` plus three short
-  scripts — `init`, `install`, and `zerith-ctl`. You can read the entire boot
+  scripts — `init`, `install`, and `zerithctl`. You can read the entire boot
   and update path in an afternoon; there's no large init system or update
   daemon to reverse-engineer.
 - **Built like a container, not assembled on the box.** The OS is an OCI image
@@ -208,7 +208,7 @@ and any new objects, never whole filesystem copies.
 
 > The `install` script performs the **initial install** (one deployment as
 > `current`, seeding `source.conf` with the update channel). From then on,
-> `zerith-ctl` drives the lifecycle on the running host — `deploy`, `update`,
+> `zerithctl` drives the lifecycle on the running host — `deploy`, `update`,
 > `rollback`/`swap`, and `gc` — handling staging, promote/demote, and object
 > reclamation. See **Host tooling** and **Status**.
 
@@ -276,7 +276,7 @@ the digest doesn't exist until the final rootfs has been rendered.)
    by the signed `root.cfs` digest and per-object fs-verity, so a tampered or
    swapped object can't satisfy the mount.
 
-**On the host (`install` / `zerith-ctl`):**
+**On the host (`install` / `zerithctl`):**
 
 7. **Pull + verify** — fetch the deployment artifact with `oras`, verify its
    `cosign` signature, then fetch object shards — skipping any whose digest
@@ -291,7 +291,7 @@ the digest doesn't exist until the final rootfs has been rendered.)
 
 The split is now clean: **everything that produces or signs an image happens in
 CI**, and the host does only verification and atomic placement. `install`
-performs steps 7–9 for the first deployment; `zerith-ctl` does them for every
+performs steps 7–9 for the first deployment; `zerithctl` does them for every
 one after.
 
 ### Integrity chain
@@ -312,7 +312,7 @@ digest that boots is the same digest that was signed in CI.
 
 ## Host tooling
 
-`zerith-ctl` operates on a running host (the `@deploy` subvolume at `/deploy`
+`zerithctl` operates on a running host (the `@deploy` subvolume at `/deploy`
 and the ESP at `/efi`). Mutating commands take an exclusive lock on `@deploy`,
 so a scheduled `update` and a hand-run `deploy` can't race each other.
 
@@ -338,6 +338,6 @@ deployment frees only the files unique to it.
 Zerith is an in-development, experimental distribution. Expect rough edges
 around tooling and packaging. The core mechanics — composefs root, digest-pinned
 UKI/Limine boot, signed `oras` / `cosign` delivery, role-based deployments with
-an N-1 fallback, the `install` → `zerith-ctl` update lifecycle, writable
+an N-1 fallback, the `install` → `zerithctl` update lifecycle, writable
 subvolumes, and factory reset — are the working foundation. It is not yet a
 daily driver; treat it as a system to learn from and build on.

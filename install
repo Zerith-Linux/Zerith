@@ -506,7 +506,7 @@ def set_role(sysroot: Path, role: str, deploy_id: str) -> None:
 
 
 def write_source_config(sysroot: Path, ref: str) -> None:
-    """Seed the update channel (zerith-ctl reads @deploy/source.conf). The
+    """Seed the update channel (zerithctl reads @deploy/source.conf). The
     channel is the deployment artifact ref `update` will pull."""
     path = deploy_root(sysroot) / "source.conf"
     data = {"schema": 1, "ref": ref, "updated_at": now()}

@@ -66,7 +66,7 @@ FROM docker.io/artixlinux/artixlinux:base-dinit
 
 COPY --from=uki-builder /out/initramfs.img /usr/lib/zerith/initramfs.img
 COPY --from=uki-builder /out/modules /usr/lib/modules
-COPY zerith-ctl /usr/local/bin/zerith-ctl
+COPY zerithctl /usr/local/bin/zerithctl
 COPY system_files /
 
 # Base Packages
