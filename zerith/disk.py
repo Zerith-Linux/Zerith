@@ -54,8 +54,10 @@ def partition_disk(disk: Path, esp_size: str, label: str) -> tuple[str, str]:
     run(["partprobe", str(disk)])
     esp_part, btrfs_part = partition_names(disk)
     run(["mkfs.fat", "-F32", "-n", f"efi-{label}", esp_part])
-    # fs-verity needs a verity-capable btrfs; the default mkfs is fine on current
-    # btrfs-progs (the kernel enables the feature on first use).
+    # btrfs fs-verity needs no mkfs flag (unlike ext4's -O verity): it's a
+    # compat_ro feature the kernel sets automatically the first time a file has
+    # verity enabled. The only requirement is kernel >= 5.15, which the shipped
+    # linux-zen satisfies; the first `fsverity enable` fails loudly otherwise.
     run(["mkfs.btrfs", "-f", "-L", label, btrfs_part])
     return esp_part, btrfs_part
 

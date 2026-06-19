@@ -13,9 +13,12 @@ Secure Boot → signed Limine → signed UKI → composefs.digest= (signed cmdli
 ```
 
 - **Secure Boot → Limine.** Firmware validates the Limine loader's signature
-  before running it.
-- **Limine → UKI.** Limine chainloads `zerith.efi`, which is signed with the
-  same key, so a tampered UKI is rejected by the firmware.
+  before running it. Limine is pinned to v12.3.3 and signed with the same key as
+  the UKI.
+- **Limine → UKI.** Limine chainloads `zerith.efi` via `efi_chainload`. For EFI
+  chainloading, Limine defers to the firmware's own Secure Boot verification of
+  the chainloaded image, so a tampered UKI is rejected by the firmware — Limine
+  itself does not need an enrolled config checksum for this link to hold.
 - **UKI → composefs digest.** The kernel command line — including
   `composefs.digest=<hex>` — is part of the signed UKI payload, so the pinned
   root digest cannot be altered without breaking the signature.

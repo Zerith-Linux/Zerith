@@ -355,17 +355,20 @@ def _missing_objects(src, shared: Path,
     return want, inlined
 
 
-def land_from_pack(src, shared: Path, *, allow_ranges: bool) -> None:
+def land_from_pack(src, shared: Path) -> None:
     """Materialize this image's objects from the single pack blob.
 
-    ``allow_ranges=False`` (fresh install): stream the whole pack once and slice
-    out the objects we need. ``allow_ranges=True`` (incremental update): fetch
-    only the byte ranges covering missing objects, coalescing nearby ones.
-    Either way :func:`place_object` re-checks every fs-verity digest before the
-    object is trusted.
+    Fetches only the byte ranges covering objects we lack, coalescing nearby
+    ones (:func:`_coalesce_ranges`). A fresh install — where every object is
+    missing — naturally collapses into a single whole-pack range, so this one
+    path serves both first install and incremental update (verified against
+    GHCR; see docs/objects.md). :func:`place_object` re-checks every fs-verity
+    digest before the object is trusted, and :func:`_fetch_range` rejects any
+    response that doesn't honor the requested Range.
     """
     require_tool("oras")
     require_tool("composefs-info")
+    require_tool("curl")
     objects_ref = src.objects_ref
     if not objects_ref:
         die("deployment metadata has no objects_ref")
@@ -381,29 +384,7 @@ def land_from_pack(src, shared: Path, *, allow_ranges: bool) -> None:
         log("objects: all present, nothing to fetch")
         return
 
-    if allow_ranges:
-        _land_pack_by_range(repo, pack_digest, want, shared)
-    else:
-        _land_pack_whole(repo, pack_digest, want, shared)
-
-
-def _land_pack_whole(repo: str, pack_digest: str,
-                     want: list[tuple[int, int, str]], shared: Path) -> None:
-    """Fetch the entire pack blob with oras and slice every wanted object out of
-    it locally. Used on a fresh install, where almost everything is missing."""
-    if runtime.DRY_RUN:
-        log(f"[dry-run] oras blob fetch whole pack {pack_digest} "
-            f"({len(want)} object(s) to slice)")
-        return
-    staging = Path(tempfile.mkdtemp(prefix="zerith-pack-"))
-    try:
-        pack = staging / "objects.pack"
-        run(["oras", "blob", "fetch", f"{repo}@{pack_digest}",
-             "--output", str(pack)], capture=True)
-        new, present = _place_from_buffer(pack, want, shared)
-        log(f"objects: landed {new} new, {present} already present (pack)")
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+    _land_pack_by_range(repo, pack_digest, want, shared)
 
 
 def _land_pack_by_range(repo: str, pack_digest: str,

@@ -1,9 +1,10 @@
 """Command-line interface for ``zerithctl``.
 
-One tool now drives the whole deployment lifecycle on a running host
+One tool drives the whole deployment lifecycle on a running host
 (``status`` / ``deploy`` / ``update`` / ``rollback`` / ``gc``) and the initial
-install (``install``). Argument parsing and dispatch live here; the work lives in
-the focused modules this imports. See docs/host-tooling.md.
+install (``install``). Options follow their subcommand
+(``zerithctl status --deploy /deploy``, ``zerithctl install --disk … --dry-run``)
+so each command is self-contained. See docs/host-tooling.md.
 """
 from __future__ import annotations
 
@@ -17,22 +18,18 @@ from .oci import source_from_local, source_from_ref
 from .runtime import die
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="zerithctl",
-        description="Install and manage Zerith deployments.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+def _common_opts() -> argparse.ArgumentParser:
+    """Run-mode flags shared by every subcommand."""
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--dry-run", action="store_true",
+                   help="print actions without changing anything")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
 
-    # Host-target + trust + run-mode options are global so existing invocations
-    # (`zerithctl --deploy X status`) keep working. `install` targets a disk or
-    # mountpoints of its own and ignores --deploy/--esp/--config.
-    p.add_argument("--deploy", type=Path, default=config.DEFAULT_DEPLOY,
-                   help="@deploy subvolume mountpoint (default /deploy)")
-    p.add_argument("--esp", type=Path, default=config.DEFAULT_ESP,
-                   help="ESP mountpoint (default /efi)")
-    p.add_argument("--config", type=Path, default=None,
-                   help="update-channel config (default <deploy>/source.conf)")
+
+def _trust_opts() -> argparse.ArgumentParser:
+    """cosign verification options (commands that pull a signed artifact)."""
+    p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--cosign-identity",
                    default=os.environ.get("ZERITH_COSIGN_IDENTITY"),
                    help="cosign --certificate-identity-regexp "
@@ -43,32 +40,53 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="cosign --certificate-oidc-issuer")
     p.add_argument("--insecure-skip-verify", action="store_true",
                    help="DEV ONLY: skip cosign verification")
-    p.add_argument("--dry-run", action="store_true",
-                   help="print actions without changing anything")
-    p.add_argument("-v", "--verbose", action="store_true")
-
-    sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("status", help="show current / fallback / staging")
-
-    deploy = sub.add_parser(
-        "deploy", help="set the update channel to REF, pull+verify it, promote")
-    deploy.add_argument(
-        "ref", help="signed artifact ref, e.g. ghcr.io/zerith-linux/zerith:latest")
-
-    sub.add_parser("update",
-                   help="pull the configured channel and promote if it changed")
-    sub.add_parser("rollback", aliases=["swap"],
-                   help="swap current <-> fallback")
-    sub.add_parser("gc",
-                   help="remove unreferenced deployments and orphaned objects")
-
-    _add_install_parser(sub)
     return p
 
 
-def _add_install_parser(sub) -> None:
+def _host_opts() -> argparse.ArgumentParser:
+    """Target paths for commands operating on an installed host."""
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--deploy", type=Path, default=config.DEFAULT_DEPLOY,
+                   help="@deploy subvolume mountpoint (default /deploy)")
+    p.add_argument("--esp", type=Path, default=config.DEFAULT_ESP,
+                   help="ESP mountpoint (default /efi)")
+    p.add_argument("--config", type=Path, default=None,
+                   help="update-channel config (default <deploy>/source.conf)")
+    return p
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="zerithctl",
+        description="Install and manage Zerith deployments.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    common, trust, host = _common_opts(), _trust_opts(), _host_opts()
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", parents=[common, host],
+                   help="show current / fallback / staging")
+
+    deploy = sub.add_parser(
+        "deploy", parents=[common, host, trust],
+        help="set the update channel to REF, pull+verify it, promote")
+    deploy.add_argument(
+        "ref", help="signed artifact ref, e.g. ghcr.io/zerith-linux/zerith:latest")
+
+    sub.add_parser("update", parents=[common, host, trust],
+                   help="pull the configured channel and promote if it changed")
+    sub.add_parser("rollback", aliases=["swap"], parents=[common, host],
+                   help="swap current <-> fallback")
+    sub.add_parser("gc", parents=[common, host],
+                   help="remove unreferenced deployments and orphaned objects")
+
+    _add_install_parser(sub, common, trust)
+    return p
+
+
+def _add_install_parser(sub, common, trust) -> None:
     inst = sub.add_parser(
-        "install",
+        "install", parents=[common, trust],
         help="partition (optional), initialize, and install Zerith",
         description="Install Zerith from a signed OCI deployment artifact onto "
                     "a whole disk (--disk) or existing mountpoints.",
@@ -87,7 +105,8 @@ def _add_install_parser(sub) -> None:
     inst.add_argument("--label", default=config.DEFAULT_LABEL,
                       help="btrfs label; MUST match the init's LABEL= "
                            "(default zerith)")
-    inst.add_argument("--ref", help="signed OCI deployment artifact ref to pull")
+    inst.add_argument(
+        "--ref", help="signed OCI deployment artifact ref to pull")
     inst.add_argument("--local", type=Path,
                       help="local CI output dir (zerith.efi, root.cfs, "
                            "deployment.json, objects/) for offline installs")

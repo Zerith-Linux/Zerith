@@ -20,23 +20,34 @@ Lifecycle commands operate on `@deploy` at `/deploy` and the ESP at `/efi`, and
 take an exclusive lock on `@deploy` while mutating. The mechanics are in
 [deployment.md](deployment.md).
 
-## Global options
+## Options
 
-These precede the subcommand (e.g. `zerithctl --deploy /deploy status`):
+Options follow their subcommand (`zerithctl status --deploy /deploy`,
+`zerithctl install --disk … --dry-run`), so each command is self-contained.
+
+Run-mode flags, accepted by every subcommand:
+
+| Option | Meaning |
+|--------|---------|
+| `--dry-run` | print actions without changing anything |
+| `-v`, `--verbose` | verbose logging |
+
+Host-target options (`status`, `deploy`, `update`, `rollback`, `gc`):
 
 | Option | Meaning |
 |--------|---------|
 | `--deploy PATH` | `@deploy` mountpoint (default `/deploy`) |
 | `--esp PATH` | ESP mountpoint (default `/efi`) |
 | `--config PATH` | update-channel config (default `<deploy>/source.conf`) |
+
+Trust options (`deploy`, `update`, `install` — commands that pull a signed
+artifact):
+
+| Option | Meaning |
+|--------|---------|
 | `--cosign-identity RE` | cosign certificate-identity regexp (env `ZERITH_COSIGN_IDENTITY`) |
 | `--cosign-issuer URL` | cosign OIDC issuer (env `ZERITH_COSIGN_ISSUER`) |
 | `--insecure-skip-verify` | DEV ONLY: skip cosign verification |
-| `--dry-run` | print actions without changing anything |
-| `-v`, `--verbose` | verbose logging |
-
-`install` targets a disk or mountpoints of its own and ignores
-`--deploy`/`--esp`/`--config`.
 
 ## `zerithctl install`
 
@@ -77,5 +88,5 @@ zerithctl status
 zerithctl deploy ghcr.io/zerith-linux/zerith:latest   # set channel + deploy
 zerithctl update                                       # pull configured channel
 zerithctl rollback                                     # boot the previous image
-zerithctl --dry-run update                             # preview an update
+zerithctl update --dry-run                             # preview an update
 ```

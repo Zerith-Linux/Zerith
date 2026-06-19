@@ -42,8 +42,7 @@ def deploy_lock(deploy: Path) -> Generator[None, None, None]:
         os.close(fd)
 
 
-def materialize(deploy: Path, src: Source, *, allow_ranges: bool,
-                old_shards: dict) -> None:
+def materialize(deploy: Path, src: Source, *, old_shards: dict) -> None:
     """Build deployment ``src`` on disk under ``@deploy``: land its objects,
     place + verify ``root.cfs``, link the GC holder, copy the UKI and loader,
     and write ``deployment.json``. Callers decide whether an existing deployment
@@ -63,8 +62,7 @@ def materialize(deploy: Path, src: Source, *, allow_ranges: bool,
     else:
         ddir.mkdir(parents=True, exist_ok=True)
 
-    _land_objects(deploy, src, shared, allow_ranges=allow_ranges,
-                  old_shards=old_shards)
+    _land_objects(deploy, src, shared, old_shards=old_shards)
     _place_root_cfs(src, root_cfs)
 
     if runtime.DRY_RUN:
@@ -74,7 +72,8 @@ def materialize(deploy: Path, src: Source, *, allow_ranges: bool,
 
     if runtime.DRY_RUN:
         log(f"[dry-run] cp {src.uki} -> {deploy_uki}")
-        log(f"[dry-run] cp {src.bootloader} -> {ddir / config.BOOTLOADER_NAME}")
+        log(f"[dry-run] cp {src.bootloader} -> {ddir /
+            config.BOOTLOADER_NAME}")
     else:
         shutil.copy2(src.uki, deploy_uki)
         if src.bootloader.is_file():
@@ -84,12 +83,12 @@ def materialize(deploy: Path, src: Source, *, allow_ranges: bool,
 
 
 def _land_objects(deploy: Path, src: Source, shared: Path, *,
-                  allow_ranges: bool, old_shards: dict) -> None:
+                  old_shards: dict) -> None:
     """Dispatch to the right object-landing strategy for this source."""
     if src.local_objects is not None:
         objects.land_from_dir(src.local_objects, shared)
     elif src.objects_pack:
-        objects.land_from_pack(src, shared, allow_ranges=allow_ranges)
+        objects.land_from_pack(src, shared)
     elif src.objects_ref:
         objects.land_from_ref(src.objects_ref, shared, src.object_shards,
                               old_shards)
@@ -123,7 +122,7 @@ def stage(deploy: Path, src: Source) -> None:
     else:
         cur_id = layout.read_role(deploy, "current")
         old_shards = layout.load_meta(deploy, cur_id).get("object_shards", {})
-        materialize(deploy, src, allow_ranges=True, old_shards=old_shards)
+        materialize(deploy, src, old_shards=old_shards)
     layout.set_role(deploy, "staging", src.deploy_id)
 
 

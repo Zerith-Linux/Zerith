@@ -5,11 +5,18 @@
 # cmdline, and Secure Boot-signs the UKI and Limine loader when a key is given.
 # Self-contained: the container has none of the repo's helpers.
 #
-# Inputs (env): DEPLOY_ID (required), SB_KEY/SB_CERT (optional PEM).
+# Inputs (env): DEPLOY_ID (required), SB_KEY/SB_CERT (optional PEM),
+#   LIMINE_VERSION / LIMINE_ZIP_SHA256 (optional; pinned defaults below).
 # Reads /rootfs (ro), writes /out.
 set -euo pipefail
 
-pacman -Sy --noconfirm composefs fsverity-utils systemd-ukify sbsigntools >/dev/null
+# Limine loader, pinned. Fetched and signed here (rather than shipped in the OS
+# image) so it is Secure Boot-signed in the same step as the UKI. See docs.
+LIMINE_VERSION="${LIMINE_VERSION:-12.3.3}"
+LIMINE_ZIP_SHA256="${LIMINE_ZIP_SHA256:-7142601b68640b2980d0f42f9be2c1878cdd49ca8c65caae2663c3d79d832abd}"
+
+pacman -Sy --noconfirm composefs fsverity-utils systemd-ukify sbsigntools \
+    curl unzip >/dev/null
 
 # 1. Render the read-only image + content-addressed object store.
 mkdir -p /out/objects
@@ -37,11 +44,13 @@ ukify build \
     --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
     --output=/out/zerith.efi
 
-# 4. Stage Limine for the same chain (firmware -> Limine -> UKI) and Secure Boot
-#    sign both, gated on a signing key being provided.
-[ -f /rootfs/usr/share/limine/BOOTX64.EFI ] \
-    || { echo "FATAL: Limine BOOTX64.EFI not in rootfs" >&2; exit 1; }
-cp /rootfs/usr/share/limine/BOOTX64.EFI /out/BOOTX64.EFI
+# 4. Fetch the pinned Limine loader (verified by sha256) for the same chain
+#    (firmware -> Limine -> UKI) and Secure Boot sign both, gated on a key.
+curl -fsSLo /tmp/limine-binary.zip \
+    "https://github.com/Limine-Bootloader/Limine/releases/download/v${LIMINE_VERSION}/limine-binary.zip"
+echo "${LIMINE_ZIP_SHA256}  /tmp/limine-binary.zip" | sha256sum -c -
+unzip -j /tmp/limine-binary.zip limine-binary/BOOTX64.EFI -d /out
+rm -f /tmp/limine-binary.zip
 
 if [ -n "${SB_KEY:-}" ] && [ -n "${SB_CERT:-}" ]; then
     printf '%s' "$SB_KEY"  > /tmp/sb.key

@@ -129,12 +129,17 @@ jobs:
           DEPLOYED_AT: ${{ steps.meta.outputs.date }}
         run: scripts/ci/pack-objects.sh
 
-      # 7. Push the OCI artifacts via oras.
+      # 7. Gate: verify the pack + index reconstruct every object byte-for-byte
+      #    before anything is pushed. Runs on every build, including PRs.
+      - name: Verify pack integrity
+        run: python3 scripts/ci/verify-pack.py
+
+      # 8. Push the OCI artifacts via oras.
       - name: Push deployment + objects
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: scripts/ci/push-artifacts.sh
 
-      # 8. Sign the deployment artifact (keyless, OIDC).
+      # 9. Sign the deployment artifact (keyless, OIDC).
       - name: Cosign sign
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:

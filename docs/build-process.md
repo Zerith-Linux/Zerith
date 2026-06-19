@@ -13,7 +13,7 @@ until the final rootfs has been rendered.
 
 ## The Containerfile
 
-A two-stage OCI build:
+A multi-stage OCI build:
 
 1. **`uki-builder` stage** (Arch base) builds the minimal busybox initramfs from
    `init`: it assembles the busybox applets, `modprobe`, and `mount.composefs`
@@ -24,7 +24,8 @@ A two-stage OCI build:
    `oras` and `cosign`, builds the AUR desktop components, and copies in the
    initramfs, the kernel modules, the `zerith` package (to `/usr/lib/zerith`),
    the `zerithctl` shim (to `/usr/local/bin`), and `system_files/`. Runtime
-   systemd is removed at the end — dinit is PID 1.
+   systemd is removed at the end — dinit is PID 1. No bootloader ships in the
+   image: the Limine loader is fetched and signed in CI (step 4 below).
 
 ## The CI pipeline
 
@@ -39,12 +40,17 @@ script in `scripts/ci/` (see [ci-workflows.md](ci-workflows.md)):
 4. **Render composefs + build/sign the UKI** — as real root: `mkcomposefs`
    produces `root.cfs` and the object store, the fs-verity digest is computed
    offline, `ukify` bakes `deploy=<id> composefs.digest=<digest>` into the UKI,
-   and `sbsign` signs both the UKI and the Limine loader for Secure Boot.
+   the pinned Limine loader (`limine-binary.zip` v12.3.3, sha256-verified) is
+   fetched, and `sbsign` signs both the UKI and the Limine loader for Secure
+   Boot in the same step.
 5. **Pack objects + write metadata** — concatenate the objects into one pack
    blob with a digest→offset index, and write `deployment.json`
    ([objects.md](objects.md)).
-6. **Push** the deployment and objects artifacts via `oras`.
-7. **Cosign-sign** the deployment artifact (keyless, via the CI OIDC identity).
+6. **Verify pack integrity** — confirm the pack + index reconstruct every
+   object byte-for-byte before anything is pushed (runs on every build,
+   including PRs).
+7. **Push** the deployment and objects artifacts via `oras`.
+8. **Cosign-sign** the deployment artifact (keyless, via the CI OIDC identity).
 
 The split is clean: everything that produces or signs an image happens in CI,
 and the host does only verification and atomic placement

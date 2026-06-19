@@ -16,9 +16,11 @@ from . import config, runtime
 from .runtime import log, run, vlog
 
 # Static two-entry config, written once at install and never touched by updates.
-# With a signed UKI + Secure Boot, editing the baked cmdline at the menu breaks
-# the signature, so the pinned composefs.digest can't be stripped at boot. Verify
-# keys/paths against your Limine version — the syntax has changed across releases.
+# Syntax confirmed against Limine v12.3.3 (the pinned version): `protocol:
+# efi_chainload` is a documented alias of the `efi` protocol, and `path:` takes
+# a `boot():/…` location. With a signed UKI + Secure Boot, the firmware's own
+# image verification gates the chainloaded UKI, so the pinned composefs.digest
+# in the UKI's signed cmdline can't be stripped at boot. See docs/boot.md.
 LIMINE_CONF = """\
 timeout: 3
 default_entry: 1
@@ -103,18 +105,15 @@ def install_limine(efi: Path, disk: Path | None = None,
 
 
 def _resolve_loader(loader_src: Path | None) -> str | None:
-    """Prefer the Secure Boot-signed loader from the artifact; fall back to the
-    local (unsigned) package copy. Returns the path to copy, or ``None`` to skip.
+    """Return the Secure Boot-signed Limine loader from the deployment artifact,
+    or ``None`` to skip. The OS image ships no loader of its own — it is fetched
+    and signed in CI and travels in the artifact — so there is no local fallback.
     """
     if loader_src is not None and loader_src.is_file():
         return str(loader_src)
-    local = "/usr/share/limine/BOOTX64.EFI"
-    log("warning: using local Limine loader (unsigned) — Secure Boot will "
-        "reject it unless you've signed it out of band")
-    if not os.path.isfile(local):
-        log(f"warning: Limine EFI loader not found at {local}, skipping")
-        return None
-    return local
+    log("warning: deployment artifact has no Limine loader; skipping bootloader "
+        "install (boot relies on an already-present loader)")
+    return None
 
 
 def _resolve_disk_partition(efi: Path, disk: Path | None,
@@ -144,7 +143,8 @@ def _create_nvram_entry(disk: Path, part_num: str) -> None:
         log("note: efivars not mounted; booting via the fallback path only")
         return
     if config.EFI_LABEL in run(["efibootmgr"], capture=True):
-        vlog(f"UEFI boot entry {config.EFI_LABEL!r} already present, leaving it")
+        vlog(f"UEFI boot entry {
+             config.EFI_LABEL!r} already present, leaving it")
         return
     run(["efibootmgr", "--create",
          "--disk", str(disk), "--part", part_num,

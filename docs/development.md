@@ -42,11 +42,14 @@ python3 zerithctl --dry-run --deploy /tmp/d --esp /tmp/e update
 
 ```sh
 python3 -m pytest -q                 # unit tests for pure logic
-python3 -m ruff check zerith/ zerithctl
-python3 -m py_compile zerith/*.py zerithctl
+python3 -m ruff check zerith/ zerithctl tests/ scripts/ci/verify-pack.py
+python3 -m py_compile zerith/*.py zerithctl scripts/ci/verify-pack.py
 shellcheck install scripts/lib/*.sh scripts/ci/*.sh
 shellcheck -s sh init
 ```
+
+Most CI steps are bash (`scripts/ci/*.sh`, linted with `shellcheck`); the
+pack-integrity gate is Python (`scripts/ci/verify-pack.py`, linted with `ruff`).
 
 Tests target functions with no I/O or filesystem-only behavior, constructing
 small fixtures in `tmp_path`. Network, signing, and partitioning paths are out
@@ -65,6 +68,7 @@ rather than burying it inside an orchestration step.
 
 ## Adding a CI step
 
-Put the shell in a new `scripts/ci/<step>.sh`, source `scripts/lib/common.sh`,
-declare its inputs with `require_env`, and call it from a one-line `run:` in the
-workflow. See [ci-workflows.md](ci-workflows.md).
+Put the step's logic in a new `scripts/ci/<step>.sh` (bash, sourcing
+`scripts/lib/common.sh` and declaring inputs with `require_env`) or, for
+pure data-processing gates, a `scripts/ci/<step>.py`, and call it from a
+one-line `run:` in the workflow. See [ci-workflows.md](ci-workflows.md).

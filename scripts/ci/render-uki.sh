@@ -22,7 +22,7 @@ sudo -E podman run --rm \
     -v "$PWD/rootfs:/rootfs:ro" \
     -v "$PWD/out:/out" \
     -v "$DIR:/ci:ro" \
-    -e DEPLOY_ID -e SB_KEY -e SB_CERT \
+    -e DEPLOY_ID -e SB_KEY -e SB_CERT -e LIMINE_VERSION -e LIMINE_ZIP_SHA256 \
     docker.io/archlinux:base bash /ci/build-uki-in-container.sh
 
 # /out is root-owned (rendered as root); hand it back to the runner so the later

@@ -14,6 +14,7 @@ guards — while every non-trivial shell step delegates to a script under
 | Export rootfs                      | `scripts/ci/export-rootfs.sh` | on the runner |
 | Render composefs + build/sign UKI  | `scripts/ci/render-uki.sh` (outer) → `build-uki-in-container.sh` (inner) | inner runs inside `archlinux:base` as root |
 | Write deployment.json + pack objects | `scripts/ci/pack-objects.sh` | on the runner |
+| Verify pack integrity              | `scripts/ci/verify-pack.py` | on the runner (pre-push gate) |
 | Push deployment + objects          | `scripts/ci/push-artifacts.sh` | on the runner |
 | Cosign sign                        | `scripts/ci/cosign-sign.sh` | on the runner |
 

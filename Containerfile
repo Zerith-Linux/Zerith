@@ -101,7 +101,6 @@ RUN pacman -Syu --noconfirm \
     e2fsprogs \
     fuse-overlayfs \
     efibootmgr \
-    limine \
     podman \
     kmod \
     pciutils \

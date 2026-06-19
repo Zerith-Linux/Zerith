@@ -7,8 +7,15 @@ UEFI firmware → Limine (ESP) → zerith.efi (UKI) → initramfs → composefs 
 ```
 
 1. **Limine (UEFI)** loads the selected deployment's UKI from the ESP. Limine is
-   Secure Boot-signed with the same key as the UKI, so the firmware validates it
-   before it runs.
+   pinned to **v12.3.3** (the official prebuilt `BOOTX64.EFI` from the binary
+   release, fetched and sha256-verified in CI, then Secure Boot-signed with the
+   same key as the UKI). It is never installed as a system package and ships only
+   in the signed deployment artifact, so the firmware validates it before it runs.
+   Limine chainloads the
+   UKI via `protocol: efi_chainload`; for EFI chainloading the firmware's own
+   Secure Boot verification gates the UKI, so Limine needs no enrolled config
+   checksum of its own — the trust comes from the firmware validating each
+   signed image in turn (see [integrity.md](integrity.md)).
 2. The **UKI (`zerith.efi`)** bundles the kernel and a minimal busybox
    initramfs, assembled with `ukify` and signed for Secure Boot.
 3. The **initramfs** loads modules, mounts the composefs root read-only —

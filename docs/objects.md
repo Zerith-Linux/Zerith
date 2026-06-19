@@ -32,18 +32,27 @@ the pack. Both are pushed as ordinary OCI blobs. Sorting by store path equals
 sorting by digest, so an unchanged set of objects produces a byte-identical pack
 — identical blob digest — and the registry deduplicates the whole push.
 
-The host fetches the small index once, computes which objects it lacks (from
-this image's `root.cfs`), and then transfers only what it needs:
+The host fetches the small index once (whole, via `oras`), computes which
+objects it lacks (from this image's `root.cfs`), and pulls **only the byte
+ranges covering those objects** with HTTP Range requests, coalescing objects
+that sit within `ZERITH_COALESCE_GAP` bytes of each other into one request.
 
-- **Fresh install** (`allow_ranges=False`) — almost everything is missing, so
-  the whole pack is streamed once with `oras` and sliced locally.
-- **Incremental update** (`allow_ranges=True`) — only the byte ranges covering
-  missing objects are fetched with HTTP Range requests, coalescing objects that
-  sit within `ZERITH_COALESCE_GAP` bytes of each other into a single request.
+A single path serves both first install and incremental update: on a fresh
+install every object is missing, and because the pack is laid out contiguously
+the coalescer collapses the whole want-list into one Range spanning the entire
+pack — i.e. a single whole-pack download. An update fetches only the handful of
+ranges its changed objects touch. This was validated against the live GHCR
+registry (Range returns `206` with exact byte counts; fetched bytes verify
+against their fs-verity digest), so there is no separate whole-pack code path.
 
-Either way, one big blob lives on the registry and downloads are surgical. Some
-referenced objects are absent from the index because composefs inlines small
-file payloads directly into `root.cfs`; those need no fetch and are skipped.
+> **Requirement:** the registry must honor HTTP Range on blob GETs. GHCR does.
+> If a registry ignored Range and returned a full body for a partial request,
+> `_fetch_range`'s strict length check turns that into a clear error rather than
+> silent corruption.
+
+Some referenced objects are absent from the index because composefs inlines
+small file payloads directly into `root.cfs`; those need no fetch and are
+skipped.
 
 ## Parallelism and progress
 

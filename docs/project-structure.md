@@ -13,7 +13,7 @@ install                    bash bootstrap — prepares the env, then runs `zerit
 zerithctl                  thin entry point that loads the zerith package
 zerith/                    the host-tooling package (install + lifecycle logic)
 scripts/
-  ci/                      shell extracted from the CI workflow (one file per step)
+  ci/                      CI step scripts (bash per step; verify-pack.py is Python)
   lib/                     shared shell helpers for the CI scripts
 .github/workflows/build.yml  CI orchestration (calls scripts/ci/*)
 system_files/              files copied verbatim into the image
