@@ -32,7 +32,7 @@ jobs:
 
     runs-on: ubuntu-24.04
 
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     strategy:
       fail-fast: false
@@ -44,7 +44,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write
+      id-token: write          # keyless cosign signing via the GH OIDC token
 
     steps:
       - name: Change image name depending on build flavor
@@ -68,40 +68,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Get current date
-        id: date
+      - name: Get current date / version
+        id: meta
         run: |
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "version=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
       - name: Generate deploy id
         id: deploy_id
         run: echo "id=${GITHUB_SHA:0:8}$(openssl rand -hex 4)" >> "$GITHUB_OUTPUT"
-
-      - name: Generate image metadata
-        id: metadata
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9
-        with:
-          images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}
-
-          tags: |
-            type=raw,value=${{ env.TAG_PREFIX }}{{date 'YYYYMMDD'}}
-            type=raw,value=${{ env.TAG_PREFIX }}${{ env.DEFAULT_TAG }}
-            type=raw,value=${{ env.TAG_PREFIX }}${{ steps.deploy_id.outputs.id }}
-            type=sha,enable=${{ github.event_name == 'pull_request' }}
-            type=ref,event=pr
-
-          labels: |
-            org.opencontainers.image.created=${{ steps.date.outputs.date }}
-            org.opencontainers.image.description=${{ env.IMAGE_DESC }}
-            org.opencontainers.image.documentation=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/${{ github.sha }}/README.md
-            org.opencontainers.image.source=https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}
-            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
-            org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }}
-            org.opencontainers.image.vendor=${{ github.repository_owner }}
-            org.opencontainers.image.version={{date 'YYYYMMDD'}}
-            org.zerith.deploy-id=${{ steps.deploy_id.outputs.id }}
-
-          sep-tags: " "
 
       - name: Build Image
         id: build_image
@@ -110,42 +85,40 @@ jobs:
           containerfiles: |
             ./Containerfile
           image: ${{ env.IMAGE_NAME }}
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
+          tags: localbuild
           build-args: |
             DEPLOY_ID=${{ steps.deploy_id.outputs.id }}
           oci: false
 
-      - name: Post-process image
+      - name: Post-process rootfs
         run: |
           set -e
           buildah unshare bash -c '
             set -e
-            buildah images
-            ctr=$(buildah from containers-storage:${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG_PREFIX }}${{ env.DEFAULT_TAG }})
+            ctr=$(buildah from containers-storage:localhost/${{ env.IMAGE_NAME }}:localbuild)
             mnt=$(buildah mount "$ctr")
 
-            # 1. Clean runtime/cache data IN THE IMAGE (note the $mnt prefix on every path)
+            # Clean runtime/cache data
             rm -rf \
                 "$mnt"/var/lib/pacman/sync/* \
                 "$mnt"/var/tmp/* \
                 "$mnt"/var/lib/dbus/machine-id
             find "$mnt/var/cache" "$mnt/var/log" -type f -delete 2>/dev/null || true
 
-            # 2. Rootfs layout BEFORE capture, so roothome/srv are included in factory /var
+            # Rootfs layout: roothome/srv live under factory /var
             rm -rf "$mnt/root" "$mnt/srv"
             mkdir -p "$mnt/var/roothome" "$mnt/var/srv"
             ln -sfn var/roothome "$mnt/root"
             ln -sfn var/srv      "$mnt/srv"
 
-            # 3. Preserve factory defaults — capture /var and relocate /etc -> /usr/etc
+            # Preserve factory defaults: capture /var, relocate /etc -> /usr/etc
             mkdir -p "$mnt/usr/share/factory"
             cp -a "$mnt/var" "$mnt/usr/share/factory/var"
             mkdir -p "$mnt/usr/etc"
             cp -a "$mnt/etc/." "$mnt/usr/etc/"
             rm -f "$mnt/usr/etc/machine-id"
 
-            # 4. NOW blank the mutable dirs back to empty mountpoints
+            # Blank the mutable dirs back to empty mountpoints
             for d in etc var home dev proc sys run tmp mnt efi deploy; do
                 rm -rf "$mnt/$d"
                 mkdir -p "$mnt/$d"
@@ -155,29 +128,121 @@ jobs:
             buildah unmount "$ctr"
             buildah commit "$ctr" post-processed
             buildah rm "$ctr"
-            for tag in ${{ steps.metadata.outputs.tags }}; do
-              buildah tag post-processed "$tag"
-            done
           '
 
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Export rootfs
+        run: |
+          set -e
+          mkdir -p rootfs
+          cid=$(podman create localhost/post-processed)
+          podman export "$cid" | sudo tar -x -C rootfs
+          podman rm "$cid"
 
-      - name: Push To GHCR
-        uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2
-        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        id: push
+      - name: Render composefs + build/sign UKI
         env:
-          REGISTRY_USER: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ github.token }}
-        with:
-          registry: ${{ env.IMAGE_REGISTRY }}
-          image: ${{ env.IMAGE_NAME }}
-          tags: ${{ steps.metadata.outputs.tags }}
-          username: ${{ env.REGISTRY_USER }}
-          password: ${{ env.REGISTRY_PASSWORD }}
+          DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
+          SB_KEY: ${{ secrets.SB_KEY }}
+          SB_CERT: ${{ secrets.SB_CERT }}
+        run: |
+          set -e
+          mkdir -p out
+          podman run --rm \
+            -v "$PWD/rootfs:/rootfs:ro" \
+            -v "$PWD/out:/out" \
+            -e DEPLOY_ID -e SB_KEY -e SB_CERT \
+            docker.io/archlinux:base bash -euo pipefail -c '
+              pacman -Sy --noconfirm composefs fsverity-utils systemd-ukify sbsigntools >/dev/null
+
+              mkdir -p /out/objects
+              mkcomposefs --digest-store=/out/objects /rootfs /out/root.cfs
+
+              DIGEST=$(fsverity digest /out/root.cfs | awk "{print \$1}" | sed "s/^sha256://")
+              [ -n "$DIGEST" ] || { echo "FATAL: empty composefs digest" >&2; exit 1; }
+              echo "$DIGEST" > /out/composefs.digest
+              echo "composefs.digest=$DIGEST"
+
+              KVER=$(ls /rootfs/usr/lib/modules | grep -v "^extramodules" | head -n1)
+              ukify build \
+                --linux="/rootfs/usr/lib/modules/$KVER/vmlinuz" \
+                --initrd="/rootfs/usr/lib/zerith/initramfs.img" \
+                --cmdline "deploy=$DEPLOY_ID composefs.digest=$DIGEST" \
+                --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
+                --output=/out/zerith.efi
+
+              if [ -n "$SB_KEY" ] && [ -n "$SB_CERT" ]; then
+                printf "%s" "$SB_KEY"  > /tmp/sb.key
+                printf "%s" "$SB_CERT" > /tmp/sb.crt
+                sbsign --key /tmp/sb.key --cert /tmp/sb.crt \
+                       --output /out/zerith.efi /out/zerith.efi
+                sbverify --cert /tmp/sb.crt /out/zerith.efi
+                rm -f /tmp/sb.key /tmp/sb.crt
+                echo "UKI signed for Secure Boot"
+              else
+                echo "::warning::SB_KEY/SB_CERT not set — UKI is UNSIGNED. Secure Boot will reject it."
+              fi
+            '
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "${{ github.token }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Write deployment.json
+        env:
+          DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -e
+          OBJ_REF="${IMAGE_REGISTRY}/${IMAGE_NAME}-objects:${DEPLOY_ID}"
+          DIGEST=$(cat out/composefs.digest)
+          cat > out/deployment.json <<EOF
+          {
+            "schema": 1,
+            "deploy_id": "${DEPLOY_ID}",
+            "version": "${VERSION}",
+            "composefs_digest": "${DIGEST}",
+            "objects_ref": "${OBJ_REF}",
+            "deployed_at": "${{ steps.meta.outputs.date }}"
+          }
+          EOF
+          {
+            echo "OBJ_REF=${OBJ_REF}"
+            echo "DEPLOY_REF_ID=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEPLOY_ID}"
+            echo "DEPLOY_REF_CHANNEL=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEFAULT_TAG}"
+          } >> "$GITHUB_ENV"
+
+      - name: Push deployment + objects
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          set -e
+          cd out
+
+          oras push "$DEPLOY_REF_ID" \
+            --artifact-type application/vnd.zerith.deployment+json \
+            deployment.json:application/vnd.zerith.deployment.config+json \
+            zerith.efi:application/vnd.zerith.uki \
+            root.cfs:application/vnd.zerith.composefs.image+erofs
+          # Move the channel tag to this build.
+          oras tag "$DEPLOY_REF_ID" "${TAG_PREFIX}${DEFAULT_TAG}"
+
+          # Objects: NB very large images can exceed ARG_MAX here; if so, batch
+          # the find output with xargs into repeated `oras push --no-tty` calls.
+          find objects -type f -printf '%p:application/octet-stream\n' > /tmp/objlist
+          oras push "$OBJ_REF" \
+            --artifact-type application/vnd.zerith.objects \
+            $(cat /tmp/objlist)
+
+      - name: Cosign sign
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -e
+          cosign sign "$DEPLOY_REF_ID"
+          cosign sign "$OBJ_REF"

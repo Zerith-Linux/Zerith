@@ -34,11 +34,17 @@ for fs in erofs overlay; do
 done
 [ -e /dev/loop-control ] || die "loop not available"
 
-# --- pick deploy, locate the boot device ----------------------------------------
+# --- pick deploy, read the pinned root digest, locate the boot device ----------
 BOOTDEV="LABEL=zerith"
 for arg in $(cat /proc/cmdline); do
-    case "$arg" in deploy=*) deploy="${arg#deploy=}" ;; esac
+    case "$arg" in
+        deploy=*)           deploy="${arg#deploy=}" ;;
+        composefs.digest=*) cfsdigest="${arg#composefs.digest=}" ;;
+    esac
 done
+[ -n "$deploy" ]    || die "deploy= missing from kernel cmdline"
+# The digest is the anchor for the whole integrity chain — refuse to boot blind.
+[ -n "$cfsdigest" ] || die "composefs.digest= missing from kernel cmdline"
 
 resolve_dev() { DEV="$(findfs "$BOOTDEV" 2>/dev/null)"; [ -b "$DEV" ]; }
 retry 20 resolve_dev || die "$BOOTDEV not found"
@@ -54,8 +60,12 @@ BASE="/mnt/@deploy/$deploy"
 # priming an erofs loop mount first gets the kernel to set one up.
 mkdir -p /tmp/prime
 mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
-mount.composefs "$BASE/root.cfs" /sysroot -o basedir=/mnt/@deploy/shared/objects \
-    || die "composefs mount failed"
+# digest=  -> the image's own fs-verity digest must equal the signed value.
+# verity   -> every backing object must carry the fs-verity digest recorded in
+#             the image, or the open is refused by the kernel.
+mount.composefs "$BASE/root.cfs" /sysroot \
+    -o basedir=/mnt/@deploy/shared/objects,digest="$cfsdigest",verity \
+    || die "composefs mount failed (digest/verity mismatch — refusing to boot)"
 
 EFIDEV="$(findfs LABEL=efi-zerith 2>/dev/null)"
 [ -n "$EFIDEV" ] && [ -b "$EFIDEV" ] || die "EFI partition not found"

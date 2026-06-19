@@ -19,8 +19,9 @@ runtime is confined to a small, well-defined set of writable areas. Updates are
 **atomic image swaps**, not in-place package upgrades, and any deployment can
 be rolled back to the previous known-good state.
 
-It is built from OCI container images, converted to composefs, packed into a
-Unified Kernel Image (UKI), and booted by Limine under UEFI.
+It is built from OCI container images, rendered to composefs and packed into a
+**signed** Unified Kernel Image (UKI) in CI, then delivered as signed OCI
+artifacts and booted by Limine under UEFI.
 
 ## Why Zerith?
 
@@ -67,6 +68,9 @@ core really needs — that's the point of Zerith.
   variable data in `/var`, user data in `/home`. Nothing else persists.
 - **Reproducible builds** — the OS is produced by a container build pipeline,
   so an image is a deterministic artifact you can rebuild and inspect.
+- **Verified end to end** — the composefs digest is pinned in the Secure
+  Boot-signed UKI and enforced at mount by fs-verity, and update artifacts are
+  signed and checked before they ever touch disk.
 - **Recoverable by design** — a clean factory copy of `/var` ships inside the
   image, so the machine can always be reset to defaults.
 
@@ -83,15 +87,19 @@ UEFI firmware → Limine (ESP) → zerith.efi (UKI) → initramfs → composefs 
 1. **Limine (UEFI)** loads the selected deployment's Unified Kernel Image from the
    EFI System Partition.
 2. The **UKI (`zerith.efi`)** bundles the kernel and a minimal busybox
-   initramfs; it is assembled with `ukify`.
+   initramfs; it is assembled with `ukify` and signed for Secure Boot.
 3. The **initramfs** loads the required modules, mounts the composefs root
-   read-only, layers the writable subvolumes on top, and `switch_root`s into
-   the real system.
+   read-only — verifying it against the digest pinned in the UKI's signed
+   command line, with per-object integrity enforced by fs-verity — layers the
+   writable subvolumes on top, and `switch_root`s into the real system.
 4. **dinit** takes over as PID 1 inside the immutable root.
 
-Kernel command line: `deploy=<id>` — baked into each deployment's UKI at build
-time, it names which deployment directory to mount. The boot device is located
-by filesystem label (`LABEL=zerith`), so the command line carries no device path.
+Kernel command line: `deploy=<id> composefs.digest=<digest>` — baked into each
+deployment's signed UKI at build time. `deploy=` names which deployment
+directory to mount; `composefs.digest=` pins the exact root image the initramfs
+is allowed to mount, so a tampered or swapped `root.cfs` is refused at boot. The
+boot device is located by filesystem label (`LABEL=zerith`), so the command
+line carries no device path.
 
 ### The read-only root (composefs)
 
@@ -103,8 +111,10 @@ The root filesystem is a **composefs** image, made of two parts:
 
 At boot the initramfs runs `mount.composefs`, which assembles these into a
 single read-only root. Because file content is content-addressed, multiple
-deployments share identical files instead of duplicating them, and the image
-can optionally be integrity-verified with fs-verity.
+deployments share identical files instead of duplicating them. Integrity is
+enforced rather than optional: the root is mounted against the digest pinned in
+the signed UKI, and every backing object must carry the fs-verity digest
+recorded in `root.cfs` or the kernel refuses to open it.
 
 The OS uses a `/usr`-merged layout: `/bin`, `/lib`, `/lib64`, and `/sbin` are
 symlinks into `/usr`, and everything the OS ships lives under `/usr`.
@@ -128,9 +138,9 @@ btrfs contents on `sdx2`:
   <id>/root.cfs               #   per-deployment composefs index
   <id>/zerith.efi             #   per-deployment UKI (source for the ESP copy)
   <id>/objects/               #   per-deployment hardlink holder (object GC refcount)
-  <id>/deployment.json        #   self-describing metadata (id / version / image)
+  <id>/deployment.json        #   self-describing metadata (id / version / digest / objects ref)
   shared/objects/             #   shared content-addressed object store
-  source.conf                 #   update channel (the image `update` pulls)
+  source.conf                 #   update channel (the signed artifact ref `update` pulls)
 @var                          # subvolume → /var   (persistent)
 @home                         # subvolume → /home  (persistent)
 ```
@@ -214,26 +224,74 @@ by the running system and always matches the deployed OS.
 
 ## Build pipeline
 
-Zerith images are produced from container images, not assembled on the target:
+Zerith images are produced entirely by CI and delivered as **signed OCI
+artifacts** — the target never renders an image or pulls a container, it only
+verifies and lands prebuilt pieces.
 
-1. **Compose the OS** as an OCI image (Artix `base-dinit` + packages).
-2. **Capture factory `/var`** — clean regenerable caches/logs, then copy the
-   skeleton to `/usr/share/factory/var`.
-3. **Move `/etc` to `/usr/etc`** — this becomes the lower layer for the runtime
-   `/etc` overlay.
-4. **Post-process** — strip mutable/volatile content (`/var`, `/etc`, `/home`,
-   …) while keeping empty mountpoints.
-5. **Convert to composefs** — `mkcomposefs` produces `root.cfs` and populates
-   the shared object store.
-6. **Build the UKI** — `ukify` bundles the kernel + initramfs into
-   `zerith.efi`.
-7. **Deploy** — write the new image as a deploy-id directory, sync objects into
-   the shared store, promote it to `current` (demoting the old current to
-   `fallback`), and copy its UKI to `/zerith/current.efi` on the ESP.
+One subtlety drives the whole shape of this: the composefs image's digest must
+be known *before* the UKI is signed, because that digest is baked into the
+UKI's signed kernel command line. So the composefs is rendered in CI, its
+digest is pinned into the UKI, and the UKI is signed — all before anything is
+published. (This is why the UKI is no longer built inside the `Containerfile`:
+the digest doesn't exist until the final rootfs has been rendered.)
 
-Steps 1–4 and 6 are the **image build** (the `Containerfile`, run in CI). Steps
-5 and 7 happen on the host at **install/update time** — `install` does them for
-the first deployment, and `zerith-ctl` for every one after.
+**In CI (`build.yml`):**
+
+1. **Compose the OS** as an OCI image (Artix `base-dinit` + packages) via the
+   `Containerfile`. The build also stashes the kernel and initramfs in the
+   image for the render step.
+2. **Post-process** — capture a clean `/var` skeleton to
+   `/usr/share/factory/var`, relocate `/etc` to `/usr/etc` (the lower layer for
+   the runtime overlay), and blank the mutable dirs back to empty mountpoints.
+3. **Render composefs** — `mkcomposefs` produces `root.cfs` and the
+   content-addressed object store, and the image's fs-verity digest is computed
+   offline.
+4. **Build + sign the UKI** — `ukify` bundles the kernel + initramfs with
+   `deploy=<id> composefs.digest=<digest>` on the command line, then `sbsign`
+   signs it for Secure Boot. The pinned digest is now part of the signed payload.
+5. **Push via `oras`** — two artifacts go to the registry:
+   - a **deployment artifact** (the signed UKI + `root.cfs` + `deployment.json`),
+     unique per build;
+   - an **objects artifact**, one blob per object. The registry deduplicates
+     blobs by content, so unchanged objects aren't re-uploaded and a target only
+     fetches the objects it's missing.
+6. **Sign with `cosign`** — both artifacts are signed (keyless, via the CI
+   OIDC identity), so the host can verify provenance before trusting them.
+
+**On the host (`install` / `zerith-ctl`):**
+
+7. **Pull + verify** — fetch the deployment artifact with `oras`, verify its
+   `cosign` signature, then fetch only the objects not already present.
+8. **Land + seal** — verify each object's fs-verity digest against its store
+   path and enable fs-verity on it; place `root.cfs`, enable fs-verity, and
+   confirm its measured digest matches the value signed into the UKI.
+9. **Promote** — install the UKI to the deploy-id directory and the ESP, flip
+   `current` (demoting the old current to `fallback`), and (on first install)
+   seed `source.conf` with the update channel.
+
+The split is now clean: **everything that produces or signs an image happens in
+CI**, and the host does only verification and atomic placement. `install`
+performs steps 7–9 for the first deployment; `zerith-ctl` does them for every
+one after.
+
+### Integrity chain
+
+Each link is checked by the one before it:
+
+```
+Secure Boot → signed UKI → composefs.digest= (signed cmdline)
+   → mount.composefs digest= (root image) → verity (every backing object)
+```
+
+and, for the update path, `cosign` over the OCI artifacts gates what is ever
+allowed to land on disk. Nothing is rendered on the target, so the digest that
+boots is the same digest that was signed in CI.
+
+> Secure Boot enforcement is only as strong as your key setup: the UKI is
+> signed when you provide signing keys to the build (`SB_KEY` / `SB_CERT`), and
+> the firmware will only honour that signature once the matching certificate is
+> enrolled in its `db`. Without those, builds still work — the UKI just ships
+> unsigned and the chain falls back to the `cosign` + fs-verity guarantees.
 
 ---
 
@@ -246,8 +304,8 @@ so a scheduled `update` and a hand-run `deploy` can't race each other.
 | Command            | What it does                                                        |
 |--------------------|---------------------------------------------------------------------|
 | `status`           | show the update channel and the current / fallback / staging roles  |
-| `deploy IMAGE`     | set the update channel to `IMAGE`, pull it, and promote to current  |
-| `update`           | pull the configured channel image and promote it if it changed      |
+| `deploy REF`       | set the update channel to `REF`, pull + verify it, and promote to current |
+| `update`           | pull the configured channel, verify it, and promote it if it changed |
 | `rollback` (`swap`)| swap current ⇄ fallback                                             |
 | `gc`               | drop unreferenced deployments and sweep orphaned objects            |
 
@@ -261,8 +319,8 @@ removing an old deployment frees only the files unique to it.
 ## Status
 
 Zerith is an in-development, experimental distribution. Expect rough edges
-around tooling and packaging. The core mechanics — composefs root, UKI/Limine
-boot, role-based deployments with an N-1 fallback, the `install` → `zerith-ctl`
-update lifecycle, writable subvolumes, and factory reset — are the working
-foundation. It is not yet a daily driver; treat it as a system to learn from
-and build on.
+around tooling and packaging. The core mechanics — composefs root, digest-pinned
+UKI/Limine boot, signed `oras` / `cosign` delivery, role-based deployments with
+an N-1 fallback, the `install` → `zerith-ctl` update lifecycle, writable
+subvolumes, and factory reset — are the working foundation. It is not yet a
+daily driver; treat it as a system to learn from and build on.

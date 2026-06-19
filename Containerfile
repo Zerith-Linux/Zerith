@@ -60,18 +60,11 @@ RUN cp /init "$INITRAMFS/init" && chmod +x "$INITRAMFS/init" && \
     cd "$INITRAMFS" && \
     find . -print0 | cpio --null -ov --format=newc | gzip -9 > /out/initramfs.img
 
-RUN KVER="$(cat /kver)"; \
-    ukify build \
-        --linux="/usr/lib/modules/$KVER/vmlinuz" \
-        --initrd=/out/initramfs.img \
-        --cmdline "deploy=$DEPLOY_ID" \
-        --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
-        --output=/out/zerith.efi
-
 RUN cp -a "/usr/lib/modules" /out/modules
 
 FROM docker.io/artixlinux/artixlinux:base-dinit
-COPY --from=uki-builder /out/zerith.efi /usr/lib/uki/zerith.efi
+
+COPY --from=uki-builder /out/initramfs.img /usr/lib/zerith/initramfs.img
 COPY --from=uki-builder /out/modules /usr/lib/modules
 COPY zerith-ctl /usr/local/bin/zerith-ctl
 COPY system_files /
@@ -98,6 +91,7 @@ RUN pacman -Syu --noconfirm \
     polkit \
     btrfs-progs \
     composefs \
+    fsverity-utils \
     dosfstools \
     e2fsprogs \
     fuse-overlayfs \
@@ -128,7 +122,7 @@ RUN pacman -Syu --noconfirm \
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     su aur -c "cd /home/aur && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm" && \
-    su aur -c "yay -S --noconfirm mangowm vibepanel-bin veila-bin" && \
+    su aur -c "yay -S --noconfirm mangowm vibepanel-bin veila-bin cosign oras-bin" && \
     pacman -Rs --noconfirm base-devel && \
     pacman -Scc --noconfirm && \
     userdel -r aur && \
