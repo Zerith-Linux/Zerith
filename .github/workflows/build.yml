@@ -235,15 +235,31 @@ jobs:
           OBJ_REF="${IMAGE_REGISTRY}/${IMAGE_NAME}-objects:${DEPLOY_ID}"
           DIGEST=$(cat out/composefs.digest)
 
-          # Deterministic tar per prefix dir (sorted, zeroed metadata) so an
-          # unchanged prefix yields a byte-identical blob -> identical digest.
-          mkdir -p out/shards
-          ( cd out/objects && for d in */; do
-              d="${d%/}"
+          SHARD_HEX=3
+          mkdir -p out/shards /tmp/groups
+          ( cd out/objects
+            # Bucket every object by the first $SHARD_HEX hex chars of its digest.
+            # Sort first so the grouping awk only ever holds ONE file handle open
+            # (it closes the previous group when the prefix rolls over) -- avoids
+            # the "too many open files" blowup at tens of thousands of buckets.
+            # relpath stays "<2hex>/<rest>" so the client extractor is unchanged.
+            find . -type f | sed 's|^\./||' \
+              | awk -v n="$SHARD_HEX" '{ h=$0; gsub("/","",h);
+                                        print substr(h,1,n) "\t" $0 }' \
+              | LC_ALL=C sort \
+              | awk -F'\t' '
+                  $1!=cur { if (cur!="") close(out); cur=$1; out="/tmp/groups/" $1 }
+                  { print $2 >> out }
+                  END { if (cur!="") close(out) }'
+            # One deterministic tar per occupied prefix.
+            for g in /tmp/groups/*; do
+              [ -e "$g" ] || continue
+              pfx="$(basename "$g")"
               tar --sort=name --mtime='@0' --owner=0 --group=0 \
                   --numeric-owner --format=ustar \
-                  -cf "../shards/${d}.tar" "$d"
+                  -cf "../shards/${pfx}.tar" -T "$g"
             done )
+          echo "packed $(ls out/shards | wc -l) shard(s) at ${SHARD_HEX}-hex prefix"
 
           # prefix -> "sha256:<hex>"
           : > /tmp/shardmap
@@ -300,6 +316,14 @@ jobs:
             [ -e "$f" ] || continue
             args+=( "${f}:application/vnd.zerith.objects.shard.tar" )
           done
+          # A single oras push = a single manifest, so every shard rides one
+          # argv. At very high shard counts (fine SHARD_HEX on a big rootfs)
+          # this can exceed ARG_MAX or produce a manifest the registry rejects.
+          # Warn loudly with the remedy rather than dying on a cryptic error.
+          if [ "${#args[@]}" -gt 20000 ]; then
+            echo "::warning::${#args[@]} object shards in one push -- if this" \
+                 "fails on ARG_MAX or a manifest limit, lower SHARD_HEX (e.g. 3)."
+          fi
           oras push "$OBJ_REF" \
             --artifact-type application/vnd.zerith.objects \
             --concurrency 16 \

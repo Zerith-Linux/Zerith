@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -448,13 +449,63 @@ def _land_full(objects_ref: str, shared: Path) -> None:
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def _human_bytes(n: float) -> str:
+    """Human-readable byte size / rate, e.g. '6.1 MiB' or '512 B'."""
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    i = 0
+    while n >= 1024.0 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    return f"{n:.0f} {units[i]}" if i == 0 else f"{n:.1f} {units[i]}"
+
+
+class _Progress:
+    """Single-writer download bar for the object fetch. Only the main thread
+    calls update()/finish(), so nothing races on the terminal. On a non-TTY
+    (logs / CI / journald) it stays silent and the caller's finish() summary is
+    the only line emitted — no stray \\r control codes in captured output."""
+
+    _BAR_WIDTH = 22
+
+    def __init__(self, total: int, label: str = "objects") -> None:
+        self.total = max(1, total)
+        self.label = label
+        self.done = 0
+        self.nbytes = 0
+        self.start = time.monotonic()
+        self.tty = sys.stderr.isatty()
+
+    def update(self, nbytes: int) -> None:
+        self.done += 1
+        self.nbytes += nbytes
+        if not self.tty:
+            return
+        filled = int(self._BAR_WIDTH * self.done / self.total)
+        bar = "█" * filled + "░" * (self._BAR_WIDTH - filled)
+        elapsed = max(time.monotonic() - self.start, 1e-6)
+        sys.stderr.write(
+            f"\r\033[Kzerithctl: {self.label} [{bar}] "
+            f"{self.done}/{self.total}  {_human_bytes(self.nbytes)}  "
+            f"{_human_bytes(self.nbytes / elapsed)}/s")
+        sys.stderr.flush()
+
+    def finish(self, msg: str) -> None:
+        if self.tty:
+            sys.stderr.write("\r\033[K")        # wipe the bar line first
+            sys.stderr.flush()
+        log(msg)
+
+
 def _fetch_shard(repo: str, pfx: str, digest: str, staging: Path) -> Path:
     """Fetch one shard blob to staging/<pfx>.tar and return its path. Safe to
     run from a worker thread: it only touches its own tar file and shells out to
     oras (which releases the GIL while it waits on the network)."""
     tar_path = staging / f"{pfx}.tar"
-    run(["oras", "blob", "fetch", f"{
-        repo}@{digest}", "--output", str(tar_path)])
+    # capture=True: oras then writes to a pipe, not the TTY, so it won't draw its
+    # own animated progress bar. The single bar in land_objects_from_ref (driven
+    # only by the main thread) owns the terminal instead — no interleaving.
+    run(["oras", "blob", "fetch", f"{repo}@{digest}",
+         "--output", str(tar_path)], capture=True)
     return tar_path
 
 
@@ -487,21 +538,28 @@ def land_objects_from_ref(objects_ref: str, shared: Path,
     try:
         new = present = 0
         jobs = max(1, min(FETCH_JOBS, len(todo)))
+        prog = _Progress(len(todo), label="objects")
         # Fetch shards in parallel; extract each as it arrives. Downloads run on
-        # worker threads (overlapping the wire), while extraction stays on this
-        # thread so the shared store is only ever written by one writer.
+        # worker threads (overlapping the wire), while extraction AND all
+        # terminal output stay on this thread — so the shared store has a single
+        # writer and the progress bar has a single writer.
         with ThreadPoolExecutor(max_workers=jobs) as pool:
             futs = {pool.submit(_fetch_shard, repo, pfx, digest, staging): pfx
                     for pfx, digest in todo}
             for fut in as_completed(futs):
                 tar_path = fut.result()        # re-raises any fetch failure here
+                nbytes = tar_path.stat().st_size
                 a, b = _extract_shard(tar_path, shared)
                 new += a
                 present += b
                 tar_path.unlink(missing_ok=True)
-        log(f"objects: {len(todo)} changed shard(s) of {len(new_shards)} "
-            f"(fetched {jobs}-way parallel); "
-            f"extracted {new} new, {present} already present")
+                prog.update(nbytes)
+        elapsed = max(time.monotonic() - prog.start, 1e-6)
+        prog.finish(
+            f"objects: {len(todo)} changed shard(s) of {len(new_shards)} "
+            f"({jobs}-way parallel); {new} new, {present} present; "
+            f"{_human_bytes(prog.nbytes)} in {elapsed:.1f}s "
+            f"({_human_bytes(prog.nbytes / elapsed)}/s avg)")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
