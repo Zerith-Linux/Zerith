@@ -98,7 +98,6 @@ RUN pacman -Syu --noconfirm \
     efibootmgr \
     limine \
     podman \
-    cosign \
     kmod \
     pciutils \
     usbutils \
@@ -121,14 +120,20 @@ RUN pacman -Syu --noconfirm \
     awww
 
 RUN set -eux; \
-    VERSION="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-      https://github.com/oras-project/oras/releases/latest | \
-      sed 's#.*/tag/v##')"; \
-    curl -fsSLo "oras.tar.gz" \
+    VERSION="$(curl -fsSL https://api.github.com/repos/oras-project/oras/releases/latest | \
+      sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p')"; \
+    curl -fsSLo oras.tar.gz \
       "https://github.com/oras-project/oras/releases/download/v${VERSION}/oras_${VERSION}_linux_amd64.tar.gz"; \
     tar -xzf oras.tar.gz; \
     install -Dm755 oras /usr/local/bin/oras; \
     rm -f oras.tar.gz oras
+
+RUN set -eux; \
+    VERSION="$(curl -fsSL https://api.github.com/repos/sigstore/cosign/releases/latest | \
+      sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p')"; \
+    curl -fsSLo /usr/local/bin/cosign \
+      "https://github.com/sigstore/cosign/releases/download/v${VERSION}/cosign-linux-amd64"; \
+    chmod 755 /usr/local/bin/cosign
 
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
