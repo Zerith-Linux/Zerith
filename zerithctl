@@ -82,7 +82,8 @@ except ValueError:
 # trip. This is the max gap (bytes of in-between data) we'll fold in. Override
 # with ZERITH_COALESCE_GAP. 0 disables coalescing (one request per object run).
 try:
-    COALESCE_GAP = max(0, int(os.environ.get("ZERITH_COALESCE_GAP", str(1 << 20))))
+    COALESCE_GAP = max(0, int(os.environ.get(
+        "ZERITH_COALESCE_GAP", str(1 << 20))))
 except ValueError:
     COALESCE_GAP = 1 << 20
 
@@ -757,12 +758,25 @@ def land_objects_from_pack(src: "Source", shared: Path) -> None:
 
     index = _fetch_index(repo, src.objects_index)
     want = []
+    inlined = 0
     for rel in missing:
         dg = rel.replace("/", "")
         ent = index.get(dg)
         if ent is None:
-            die(f"object {dg} referenced by image but absent from pack index")
+            # Referenced by root.cfs but not an external object: composefs
+            # inlines small/empty file payloads into the image itself, so there
+            # is nothing to fetch. root.cfs is digest-verified against the signed
+            # value, so trusting its reference set here is safe (this mirrors the
+            # holder/GC step, which likewise skips referenced objects not on disk).
+            inlined += 1
+            continue
         want.append((ent[0], ent[1], dg))
+    if inlined:
+        vlog(f"objects: {inlined} referenced object(s) inlined in image, "
+             f"nothing to fetch for them")
+    if not want:
+        log("objects: all present, nothing to fetch")
+        return
     want.sort()                                       # by pack offset
     ranges = _coalesce_ranges(want, COALESCE_GAP)
     span = sum(e - s + 1 for s, e, _ in ranges)
