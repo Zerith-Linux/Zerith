@@ -211,10 +211,7 @@ def load_meta(deploy: Path, deploy_id: str | None) -> dict:
     if not deploy_id:
         return {}
     try:
-        return json.loads(
-            (deploy_dir(deploy,
-                        deploy_id) / "deployment.json"
-             ).read_text())
+        return json.loads((deploy_dir(deploy, deploy_id) / "deployment.json").read_text())
     except (OSError, ValueError):
         return {}
 
@@ -248,6 +245,11 @@ def write_source(config: Path, ref: str) -> None:
 
 def esp_uki(esp: Path, role: str) -> Path:
     return esp / "zerith" / f"{role}.efi"
+
+
+def esp_limine(esp: Path) -> Path:
+    """The Limine loader on the ESP (the efibootmgr entry points here)."""
+    return esp / "EFI" / "zerith-limine" / "BOOTX64.EFI"
 
 
 def atomic_copy(src: Path, dst: Path) -> None:
@@ -300,6 +302,10 @@ class Source:
     @property
     def root_cfs(self) -> Path:
         return self.staging / CFS_NAME
+
+    @property
+    def bootloader(self) -> Path:
+        return self.staging / "BOOTX64.EFI"
 
     @property
     def deploy_id(self) -> str:
@@ -552,11 +558,14 @@ def stage(deploy: Path, src: Source) -> None:
         else:
             link_holder(shared, holder, root_cfs)
 
-        # 4. Keep the deployment's UKI with it.
+        # 4. Keep the deployment's UKI (and signed Limine loader) with it.
         if DRY_RUN:
             log(f"[dry-run] cp {src.uki} -> {btrfs_uki}")
+            log(f"[dry-run] cp {src.bootloader} -> {ddir / 'BOOTX64.EFI'}")
         else:
             shutil.copy2(src.uki, btrfs_uki)
+            if src.bootloader.is_file():
+                shutil.copy2(src.bootloader, ddir / "BOOTX64.EFI")
 
         write_meta(ddir, deploy_id=src.deploy_id, version=src.version,
                    digest=src.digest, objects_ref=src.objects_ref,
@@ -583,6 +592,12 @@ def promote(deploy: Path, esp: Path, new_id: str) -> None:
     if old_current is not None and (DRY_RUN or cur_efi.is_file()):
         atomic_copy(cur_efi, esp_uki(esp, "fallback"))
     atomic_copy(new_uki, cur_efi)
+
+    # Refresh the signed Limine loader so a bootloader/key update propagates.
+    # Atomic rename over the fixed path the efibootmgr entry already targets.
+    new_loader = deploy_dir(deploy, new_id) / "BOOTX64.EFI"
+    if DRY_RUN or new_loader.is_file():
+        atomic_copy(new_loader, esp_limine(esp))
 
     if old_current is not None:
         set_role(deploy, "fallback", old_current)

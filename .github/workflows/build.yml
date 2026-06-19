@@ -184,17 +184,24 @@ jobs:
                 --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
                 --output=/out/zerith.efi
 
-              # 4d. Secure Boot sign the UKI (gated on a key being provided).
+              # 4d. Stage Limine for the same chain (firmware -> Limine -> UKI),
+              #     and Secure Boot sign both (gated on a key being provided).
+              [ -f /rootfs/usr/share/limine/BOOTX64.EFI ] \
+                || { echo "FATAL: Limine BOOTX64.EFI not in rootfs" >&2; exit 1; }
+              cp /rootfs/usr/share/limine/BOOTX64.EFI /out/BOOTX64.EFI
+
               if [ -n "$SB_KEY" ] && [ -n "$SB_CERT" ]; then
                 printf "%s" "$SB_KEY"  > /tmp/sb.key
                 printf "%s" "$SB_CERT" > /tmp/sb.crt
-                sbsign --key /tmp/sb.key --cert /tmp/sb.crt \
-                       --output /out/zerith.efi /out/zerith.efi
-                sbverify --cert /tmp/sb.crt /out/zerith.efi
+                for img in /out/zerith.efi /out/BOOTX64.EFI; do
+                  sbsign --key /tmp/sb.key --cert /tmp/sb.crt \
+                         --output "$img" "$img"
+                  sbverify --cert /tmp/sb.crt "$img"
+                done
                 rm -f /tmp/sb.key /tmp/sb.crt
-                echo "UKI signed for Secure Boot"
+                echo "UKI + Limine signed for Secure Boot"
               else
-                echo "::warning::SB_KEY/SB_CERT not set — UKI is UNSIGNED. Secure Boot will reject it."
+                echo "::warning::SB_KEY/SB_CERT not set — UKI and Limine are UNSIGNED. Secure Boot will reject them."
               fi
             '
           # /out is root-owned (rendered as root); hand it back to the runner so
@@ -281,6 +288,7 @@ jobs:
               --artifact-type application/vnd.zerith.deployment+json \
               deployment.json:application/vnd.zerith.deployment.config+json \
               zerith.efi:application/vnd.zerith.uki \
+              BOOTX64.EFI:application/vnd.zerith.bootloader \
               root.cfs:application/vnd.zerith.composefs.image+erofs )
           # Move the channel tag to this build.
           oras tag "$DEPLOY_REF_ID" "${TAG_PREFIX}${DEFAULT_TAG}"

@@ -403,6 +403,10 @@ class Source:
         return self.staging / CFS_NAME
 
     @property
+    def bootloader(self) -> Path:
+        return self.staging / "BOOTX64.EFI"
+
+    @property
     def deploy_id(self) -> str:
         return self.meta["deploy_id"]
 
@@ -585,12 +589,20 @@ def disk_and_partnum(part_dev: str) -> tuple[str, str] | None:
 
 
 def install_limine(efi: Path, disk: Path | None = None,
-                   esp_part: str | None = None) -> None:
+                   esp_part: str | None = None,
+                   loader_src: Path | None = None) -> None:
     if DRY_RUN:
         log("[dry-run] install Limine (copy loader + efibootmgr entry)")
         return
 
-    limine_src = "/usr/share/limine/BOOTX64.EFI"
+    # Prefer the Secure Boot-signed loader shipped in the deployment artifact;
+    # fall back to the local (unsigned) package copy only if it wasn't shipped.
+    if loader_src is not None and loader_src.is_file():
+        limine_src = str(loader_src)
+    else:
+        limine_src = "/usr/share/limine/BOOTX64.EFI"
+        log("warning: using local Limine loader (unsigned) — Secure Boot will "
+            "reject it unless you've signed it out of band")
     if not os.path.isfile(limine_src):
         log(f"warning: Limine EFI loader not found at {limine_src}, skipping")
         return
@@ -806,9 +818,6 @@ def main(argv: list[str] | None = None) -> int:
         sysroot, efi, unmount = args.sysroot, args.efi, (lambda: None)
         limine_disk, limine_part = None, None
 
-    if not args.no_limine:
-        install_limine(efi, limine_disk, limine_part)
-
     try:
         init_layout(sysroot, efi)
         if args.ref:
@@ -818,6 +827,10 @@ def main(argv: list[str] | None = None) -> int:
             src = source_from_local(args.local)
         try:
             deploy(sysroot, efi, src)
+            # Install Limine from the (signed) loader shipped in the artifact, so
+            # the firmware -> Limine -> UKI chain is signed end to end.
+            if not args.no_limine:
+                install_limine(efi, limine_disk, limine_part, src.bootloader)
         finally:
             src.cleanup()
     finally:
