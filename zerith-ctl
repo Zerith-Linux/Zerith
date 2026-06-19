@@ -41,6 +41,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -184,15 +186,13 @@ def clear_role(deploy: Path, role: str) -> None:
 
 
 def write_meta(ddir: Path, *, deploy_id: str, version: str,
-               digest: str, objects_ref: str | None, objects_parts: int,
-               ref: str | None) -> None:
+               digest: str, objects_ref: str | None, ref: str | None) -> None:
     meta = {
         "schema": META_SCHEMA,
         "deploy_id": deploy_id,
         "version": version,
         "composefs_digest": digest,
         "objects_ref": objects_ref,
-        "objects_parts": objects_parts,
         "ref": ref,
         "deployed_at": now(),
     }
@@ -260,15 +260,6 @@ def atomic_copy(src: Path, dst: Path) -> None:
 # OCI ref helpers (oras + cosign)
 # --------------------------------------------------------------------------- #
 
-def ref_repo(ref: str) -> str:
-    at = ref.split("@", 1)[0]
-    slash = at.rfind("/")
-    last = at[slash + 1:]
-    if ":" in last:
-        return at[:slash + 1] + last.split(":", 1)[0]
-    return at
-
-
 def cosign_verify(ref: str, identity_re: str | None, issuer: str,
                   skip: bool) -> None:
     if skip:
@@ -321,10 +312,6 @@ class Source:
     def objects_ref(self) -> str | None:
         return self.meta.get("objects_ref")
 
-    @property
-    def objects_parts(self) -> int:
-        return int(self.meta.get("objects_parts", 1))
-
     def cleanup(self) -> None:
         if self._cleanup:
             self._cleanup()
@@ -332,7 +319,6 @@ class Source:
 
 def source_from_ref(ref: str, cos_id: str | None, cos_issuer: str,
                     skip_verify: bool) -> Source:
-    import tempfile
     require_tool("oras")
     cosign_verify(ref, cos_id, cos_issuer, skip_verify)
     staging = Path(tempfile.mkdtemp(prefix="zerith-pull-"))
@@ -372,44 +358,49 @@ def place_object(tmp: Path, shared: Path, rel: str) -> bool:
     return True
 
 
-def land_objects_from_ref(objects_ref: str, shared: Path, parts: int) -> None:
-    """Fetch only the objects we don't already have from the objects artifact.
+_OBJ_PATH_RE = re.compile(r"^[0-9a-f]{2}/[0-9a-f]{2,}$")
 
-    The set is sharded across <objects_ref>-partN artifacts (CI splits them so no
-    single OCI manifest exceeds the registry's ~4 MiB limit). Fetch each shard's
-    manifest, union the layers, and pull only blobs missing from the shared store.
-    """
+
+def land_objects_from_ref(objects_ref: str, shared: Path) -> None:
+    """Download the objects artifact (deterministic per-prefix tar shards) and
+    extract any objects we don't already have, verifying each one's fs-verity
+    digest against its store path and sealing it. One blob per shard keeps the
+    transfer small; per-object dedup still happens at extract time on disk."""
     require_tool("oras")
-    repo = ref_repo(objects_ref)
-    fetched = total = 0
-    for i in range(max(parts, 1)):
-        part_ref = f"{objects_ref}-part{i}"
-        manifest = json.loads(run(["oras", "manifest", "fetch", part_ref],
-                                  capture=True) or "{}")
-        layers = manifest.get("layers", [])
-        total += len(layers)
-        for layer in layers:
-            title = layer.get("annotations", {}).get(
-                "org.opencontainers.image.title", "")
-            if not title:
-                continue
-            rel = title[len("objects/")
-                            :] if title.startswith("objects/") else title
-            dest = shared / rel
-            if dest.exists():
-                continue
-            if DRY_RUN:
-                log(f"[dry-run] oras blob fetch {
-                    repo}@{layer['digest']} -> {rel}")
-                continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
-            run(["oras", "blob", "fetch", f"{repo}@{layer['digest']}",
-                 "--output", str(tmp)])
-            if place_object(tmp, shared, rel):
-                fetched += 1
-    log(f"objects: fetched {fetched} new, {total - fetched} already present "
-        f"(across {max(parts, 1)} shard(s))")
+    staging = Path(tempfile.mkdtemp(prefix="zerith-obj-"))
+    try:
+        run(["oras", "pull", objects_ref, "-o", str(staging)])
+        fetched = present = 0
+        for tarpath in sorted(staging.glob("*.tar")):
+            with tarfile.open(tarpath) as tf:
+                for m in tf.getmembers():
+                    if not m.isfile():
+                        continue
+                    rel = (m.name[len("objects/"):]
+                           if m.name.startswith("objects/") else m.name)
+                    if not _OBJ_PATH_RE.match(rel):
+                        continue            # not an object path; ignore
+                    dest = shared / rel
+                    if dest.exists():
+                        present += 1
+                        continue
+                    if DRY_RUN:
+                        log(f"[dry-run] extract object {rel}")
+                        continue
+                    extracted = tf.extractfile(m)
+                    if extracted is None:
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
+                    with open(tmp, "wb") as out:
+                        shutil.copyfileobj(extracted, out)
+                    if place_object(tmp, shared, rel):
+                        fetched += 1
+                    else:
+                        present += 1
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    log(f"objects: extracted {fetched} new, {present} already present")
 
 
 def referenced_objects(root_cfs: Path) -> set[str]:
@@ -456,7 +447,7 @@ def stage(deploy: Path, src: Source) -> None:
     if not DRY_RUN and not src.uki.is_file():
         die(f"deployment artifact has no {UKI_NAME}")
     if not src.objects_ref:
-        die(f"deployment metadata has no objects_ref")
+        die("deployment metadata has no objects_ref")
 
     if (not DRY_RUN) and root_cfs.exists():
         log(f"deployment {src.deploy_id} already on disk, reusing")
@@ -467,7 +458,7 @@ def stage(deploy: Path, src: Source) -> None:
             ddir.mkdir(parents=True, exist_ok=True)
 
         # 1. Land this image's objects into the shared store (verify + seal).
-        land_objects_from_ref(src.objects_ref, shared, src.objects_parts)
+        land_objects_from_ref(src.objects_ref, shared)
 
         # 2. Place + seal root.cfs, then verify against the signed digest.
         if DRY_RUN:
@@ -494,8 +485,7 @@ def stage(deploy: Path, src: Source) -> None:
             shutil.copy2(src.uki, btrfs_uki)
 
         write_meta(ddir, deploy_id=src.deploy_id, version=src.version,
-                   digest=src.digest, objects_ref=src.objects_ref,
-                   objects_parts=src.objects_parts, ref=src.ref)
+                   digest=src.digest, objects_ref=src.objects_ref, ref=src.ref)
 
     set_role(deploy, "staging", src.deploy_id)
 

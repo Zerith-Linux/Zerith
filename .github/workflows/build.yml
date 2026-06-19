@@ -21,10 +21,6 @@ env:
   IMAGE_NAME: "${{ github.event.repository.name }}"
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
   DEFAULT_TAG: "latest"
-  # Objects are sharded into artifacts of this many blobs each, so no single OCI
-  # manifest exceeds the registry's ~4 MiB limit (~300 B/descriptor -> stay well
-  # under it). install/zerith-ctl read objects_parts from deployment.json.
-  OBJ_BATCH: "5000"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.brand_name}}-${{ inputs.stream_name }}
@@ -146,11 +142,14 @@ jobs:
           podman rm "$cid"
 
       # ---- 4. Render composefs, pin its digest, build + sign the UKI ----------
+      # Runs as REAL root (sudo -E): mkcomposefs must read root-only files like
+      # credstore.encrypted/shadow AND record faithful uid/gid/mode into root.cfs.
+      # -E preserves DEPLOY_ID/SB_KEY/SB_CERT so the -e passthroughs carry values.
+      # fs-verity is NOT enabled here (the digest is computed offline); the target
+      # re-enables verity on landing.
       - name: Render composefs + build/sign UKI
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
-          # Secure Boot signing key/cert (PEM). Optional during bring-up: if
-          # unset, the UKI is left UNSIGNED and a loud warning is printed.
           SB_KEY: ${{ secrets.SB_KEY }}
           SB_CERT: ${{ secrets.SB_CERT }}
         run: |
@@ -213,7 +212,7 @@ jobs:
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "${{ github.token }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # ---- 6. Write per-deployment metadata (incl. object shard count) --------
+      # ---- 6. Write per-deployment metadata -----------------------------------
       - name: Write deployment.json
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
@@ -222,9 +221,6 @@ jobs:
           set -e
           OBJ_REF="${IMAGE_REGISTRY}/${IMAGE_NAME}-objects:${DEPLOY_ID}"
           DIGEST=$(cat out/composefs.digest)
-          TOTAL=$(find out/objects -type f | wc -l)
-          PARTS=$(( (TOTAL + OBJ_BATCH - 1) / OBJ_BATCH ))
-          [ "$PARTS" -lt 1 ] && PARTS=1
           cat > out/deployment.json <<EOF
           {
             "schema": 1,
@@ -232,11 +228,9 @@ jobs:
             "version": "${VERSION}",
             "composefs_digest": "${DIGEST}",
             "objects_ref": "${OBJ_REF}",
-            "objects_parts": ${PARTS},
             "deployed_at": "${{ steps.meta.outputs.date }}"
           }
           EOF
-          echo "objects: ${TOTAL} file(s) -> ${PARTS} shard(s)"
           {
             echo "OBJ_REF=${OBJ_REF}"
             echo "DEPLOY_REF_ID=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEPLOY_ID}"
@@ -244,6 +238,12 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # ---- 7. Push the OCI artifacts via oras ---------------------------------
+      # Deployment artifact = UKI + root.cfs + deployment.json (unique per build).
+      # Objects = the content store packed into ONE deterministic tar per 2-hex
+      # prefix dir, pushed as one blob each (a few hundred uploads instead of one
+      # per object — the per-object push was the 40-min timeout). Deterministic
+      # tars (sorted, zeroed mtime/owner) dedup at the registry across builds, so
+      # an unchanged prefix re-uses its existing blob.
       - name: Push deployment + objects
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: |
@@ -258,27 +258,30 @@ jobs:
           # Move the channel tag to this build.
           oras tag "$DEPLOY_REF_ID" "${TAG_PREFIX}${DEFAULT_TAG}"
 
-          # Objects, sharded. Build each batch's arg list as a bash array (no
-          # word-splitting, no ARG_MAX blow-up) and push one artifact per shard.
-          mapfile -t allobjs < <(find objects -type f -print)
-          total=${#allobjs[@]}
-          batch="${OBJ_BATCH:-5000}"
-          part=0
-          i=0
-          while [ "$i" -lt "$total" ]; do
-            args=()
-            for f in "${allobjs[@]:i:batch}"; do
-              args+=( "${f}:application/octet-stream" )
-            done
-            oras push "${OBJ_REF}-part${part}" \
-              --artifact-type application/vnd.zerith.objects \
-              "${args[@]}"
-            part=$(( part + 1 ))
-            i=$(( i + batch ))
+          # Pack one deterministic tar per prefix dir.
+          mkdir -p shards
+          ( cd objects && for d in */; do
+              d="${d%/}"
+              tar --sort=name --mtime='@0' --owner=0 --group=0 \
+                  --numeric-owner --format=ustar \
+                  -cf "../shards/${d}.tar" "$d"
+            done )
+          args=()
+          for f in shards/*.tar; do
+            [ -e "$f" ] || continue
+            args+=( "${f}:application/vnd.zerith.objects.shard.tar" )
           done
-          echo "pushed ${part} object shard(s)"
+          oras push "$OBJ_REF" \
+            --artifact-type application/vnd.zerith.objects \
+            --concurrency 16 \
+            "${args[@]}"
+          echo "pushed ${#args[@]} object shard(s)"
 
       # ---- 8. Sign the deployment artifact (keyless, OIDC) --------------------
+      # Only the deployment artifact is signed/verified: object integrity is
+      # already anchored by it (signed UKI -> composefs.digest -> verified
+      # root.cfs -> per-object fs-verity recorded inside it), so a tampered or
+      # swapped object can't satisfy the mount. The client verifies this ref.
       - name: Cosign sign
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
