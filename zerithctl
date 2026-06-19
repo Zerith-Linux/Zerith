@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +65,14 @@ DEFAULT_COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
 
 DRY_RUN = False
 VERBOSE = False
+
+# How many object shards to fetch in parallel. Shard fetches are independent
+# network round-trips, so doing them one-at-a-time leaves the link idle between
+# each blob; a small pool keeps the pipe full. Override with ZERITH_FETCH_JOBS.
+try:
+    FETCH_JOBS = max(1, int(os.environ.get("ZERITH_FETCH_JOBS", "8")))
+except ValueError:
+    FETCH_JOBS = 8
 
 
 # --------------------------------------------------------------------------- #
@@ -433,9 +442,20 @@ def _land_full(objects_ref: str, shared: Path) -> None:
             a, b = _extract_shard(tarpath, shared)
             new += a
             present += b
-        log(f"objects: extracted {new} new, {present} already present (full pull)")
+        log(f"objects: extracted {new} new, {
+            present} already present (full pull)")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def _fetch_shard(repo: str, pfx: str, digest: str, staging: Path) -> Path:
+    """Fetch one shard blob to staging/<pfx>.tar and return its path. Safe to
+    run from a worker thread: it only touches its own tar file and shells out to
+    oras (which releases the GIL while it waits on the network)."""
+    tar_path = staging / f"{pfx}.tar"
+    run(["oras", "blob", "fetch", f"{
+        repo}@{digest}", "--output", str(tar_path)])
+    return tar_path
 
 
 def land_objects_from_ref(objects_ref: str, shared: Path,
@@ -454,23 +474,33 @@ def land_objects_from_ref(objects_ref: str, shared: Path,
         return
 
     repo = ref_repo(objects_ref)
+    todo = [(pfx, digest) for pfx, digest in sorted(new_shards.items())
+            if old_shards.get(pfx) != digest]   # unchanged buckets are on disk
+
+    if DRY_RUN:
+        for pfx, digest in todo:
+            log(f"[dry-run] oras blob fetch {repo}@{digest} ({pfx})")
+        log(f"objects: {len(todo)} changed shard(s) of {len(new_shards)}")
+        return
+
     staging = Path(tempfile.mkdtemp(prefix="zerith-obj-"))
     try:
-        changed = new = present = 0
-        for pfx, digest in sorted(new_shards.items()):
-            if old_shards.get(pfx) == digest:
-                continue                       # bucket unchanged; already on disk
-            changed += 1
-            if DRY_RUN:
-                log(f"[dry-run] oras blob fetch {repo}@{digest} ({pfx})")
-                continue
-            tar_path = staging / f"{pfx}.tar"
-            run(["oras", "blob", "fetch", f"{repo}@{digest}",
-                 "--output", str(tar_path)])
-            a, b = _extract_shard(tar_path, shared)
-            new += a
-            present += b
-        log(f"objects: {changed} changed shard(s) of {len(new_shards)}; "
+        new = present = 0
+        jobs = max(1, min(FETCH_JOBS, len(todo)))
+        # Fetch shards in parallel; extract each as it arrives. Downloads run on
+        # worker threads (overlapping the wire), while extraction stays on this
+        # thread so the shared store is only ever written by one writer.
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futs = {pool.submit(_fetch_shard, repo, pfx, digest, staging): pfx
+                    for pfx, digest in todo}
+            for fut in as_completed(futs):
+                tar_path = fut.result()        # re-raises any fetch failure here
+                a, b = _extract_shard(tar_path, shared)
+                new += a
+                present += b
+                tar_path.unlink(missing_ok=True)
+        log(f"objects: {len(todo)} changed shard(s) of {len(new_shards)} "
+            f"(fetched {jobs}-way parallel); "
             f"extracted {new} new, {present} already present")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -535,7 +565,8 @@ def stage(deploy: Path, src: Source) -> None:
         #    prefix buckets that actually changed; unchanged ones are already on
         #    disk (held by the current deployment).
         cur_id = read_role(deploy, "current")
-        old_shards = load_meta(deploy, cur_id).get("object_shards", {}) if cur_id else {}
+        old_shards = load_meta(deploy, cur_id).get(
+            "object_shards", {}) if cur_id else {}
         land_objects_from_ref(src.objects_ref, shared,
                               src.object_shards, old_shards)
 
@@ -547,7 +578,8 @@ def stage(deploy: Path, src: Source) -> None:
             enable_verity(root_cfs)
             got = measure_file(root_cfs)
             if got != src.digest:
-                die(f"root.cfs digest mismatch: expected {src.digest}, got {got}")
+                die(f"root.cfs digest mismatch: expected {
+                    src.digest}, got {got}")
             vlog("root.cfs digest verified against signed metadata")
 
         # 3. Holder hardlinks for GC (only this image's objects).
@@ -735,7 +767,8 @@ def do_deploy(deploy: Path, esp: Path, ref: str, cos_id: str | None,
     src = source_from_ref(ref, cos_id, cos_issuer, skip_verify)
     try:
         if src.deploy_id == read_role(deploy, "current"):
-            log(f"already on {src.deploy_id} (version {src.version}); up to date")
+            log(f"already on {src.deploy_id} (version {
+                src.version}); up to date")
             return
         stage(deploy, src)
         promote(deploy, esp, src.deploy_id)
@@ -797,8 +830,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser(
         "update", help="pull the configured channel and promote if it changed")
 
-    sub.add_parser("rollback", aliases=["swap"], help="swap current <-> fallback")
-    sub.add_parser("gc", help="remove unreferenced deployments and orphaned objects")
+    sub.add_parser("rollback", aliases=[
+                   "swap"], help="swap current <-> fallback")
+    sub.add_parser(
+        "gc", help="remove unreferenced deployments and orphaned objects")
 
     args = p.parse_args(argv)
     DRY_RUN = args.dry_run
