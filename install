@@ -1,920 +1,149 @@
-#!/usr/bin/env python3
-"""Partition (optional), initialize, and install Zerith.
-
-Source of truth is a signed OCI deployment artifact (built by CI), pulled with
-oras and verified with cosign — NOT a container rendered locally. The artifact
-carries the signed UKI, the read-only `root.cfs`, and `deployment.json`; the
-content-addressed objects come from a companion objects artifact. Nothing is
-rendered on this machine, so the digest baked into the signed UKI is the digest
-that actually lands.
-
-Trust chain established at install time:
-    cosign verify (artifact)  ->  deployment.json.composefs_digest
-    ->  measured fs-verity digest of the landed root.cfs must match
-    ->  every object's fs-verity digest must match its store path
-At boot the signed UKI re-enforces the same digest + per-object verity.
-"""
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import re
-import shutil
-import subprocess
-import sys
-import gzip
-import tarfile
-import tempfile
-from typing import NoReturn
-from datetime import datetime, timezone
-from pathlib import Path
-
-DEFAULT_ESP_SIZE = "1GiB"
-
-# MUST match the init's LABEL=zerith
-DEFAULT_LABEL = "zerith"
-
-# Names of the files inside the deployment artifact (set by CI / oras titles).
-UKI_NAME = "zerith.efi"
-CFS_NAME = "root.cfs"
-META_NAME = "deployment.json"
-
-# Default cosign trust policy (override via flags / env). Identity is the CI
-# workflow's OIDC identity; issuer is GitHub's OIDC provider.
-DEFAULT_COSIGN_ISSUER = "https://token.actions.githubusercontent.com"
-
-DRY_RUN = False
-VERBOSE = False
-
-
-# --------------------------------------------------------------------------- #
-# Utilities
-# --------------------------------------------------------------------------- #
-
-def log(msg: str) -> None:
-    print(f"install-zerith: {msg}")
-
-
-def vlog(msg: str) -> None:
-    if VERBOSE:
-        log(msg)
-
-
-def die(msg: str) -> "NoReturn":
-    print(f"install-zerith: error: {msg}", file=sys.stderr)
-    sys.exit(1)
-
-
-def run(cmd: list[str], *, capture: bool = False, check: bool = True) -> str:
-    printable = " ".join(cmd)
-    if DRY_RUN and not capture:
-        log(f"[dry-run] {printable}")
-        return ""
-    vlog(f"exec: {printable}")
-    res = subprocess.run(cmd, text=True, capture_output=capture)
-    if res.returncode != 0 and check:
-        if capture and res.stderr:
-            sys.stderr.write(res.stderr)
-        die(f"command failed ({res.returncode}): {printable}")
-    return (res.stdout or "").strip() if capture else ""
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def require_root() -> None:
-    if not DRY_RUN and os.geteuid() != 0:
-        die("must run as root")
-
-
-def require_tool(name: str) -> None:
-    if not DRY_RUN and not shutil.which(name):
-        die(f"required tool '{name}' not found on PATH")
-
-
-# --------------------------------------------------------------------------- #
-# fs-verity helpers
-# --------------------------------------------------------------------------- #
+#!/usr/bin/env bash
 #
-# composefs names every object after its fs-verity (sha256 Merkle) digest, and
-# records the same per-file digests inside root.cfs. We (a) verify each landed
-# blob's digest matches its name BEFORE trusting it, then (b) enable kernel
-# fs-verity so the runtime `verity` mount flag is enforceable. `fsverity digest`
-# computes the value offline; `fsverity enable` seals the file on the target fs
-# (btrfs supports this).
-
-def measure_file(path: Path) -> str:
-    """Offline fs-verity sha256 digest (bare hex) of a file's contents."""
-    out = run(["fsverity", "digest", str(path)], capture=True)
-    # "sha256:<hex>  <path>"  ->  "<hex>"
-    return out.split()[0].split(":", 1)[-1]
-
-
-def enable_verity(path: Path) -> None:
-    if DRY_RUN:
-        log(f"[dry-run] fsverity enable {path}")
-        return
-    run(["fsverity", "enable", str(path)])
-
-
-# --------------------------------------------------------------------------- #
-# Disk partitioning (--disk mode)
-# --------------------------------------------------------------------------- #
-
-def partition_names(disk: Path) -> tuple[str, str]:
-    """ESP and btrfs partition node names: nvme0n1 -> p1/p2, sda -> 1/2."""
-    d = str(disk)
-    sep = "p" if d[-1].isdigit() else ""
-    return f"{d}{sep}1", f"{d}{sep}2"
-
-
-def assert_disk_free(disk: Path) -> None:
-    if DRY_RUN:
-        return
-    d = str(disk)
-    for line in Path("/proc/mounts").read_text().splitlines():
-        dev = line.split()[0]
-        if dev == d or dev.startswith(d):
-            die(f"{dev} is mounted — refusing to partition {disk}")
-
-
-def confirm_wipe(disk: Path, yes: bool) -> None:
-    if yes or DRY_RUN:
-        return
-    print(f"WARNING: this will ERASE ALL DATA on {disk}.")
-    try:
-        resp = input("Type 'yes' to continue: ")
-    except EOFError:
-        die("no terminal to confirm on; pass --yes to proceed")
-    if resp.strip().lower() != "yes":
-        die("aborted")
-
-
-def partition_disk(disk: Path, esp_size: str, label: str) -> tuple[str, str]:
-    """Wipe `disk`, lay down GPT (ESP + btrfs), format both. Returns part nodes."""
-    run(["sgdisk", "--zap-all", str(disk)])
-    run(["sgdisk", f"-n1:0:+{esp_size}", "-t1:EF00", "-c1:ESP", str(disk)])
-    run(["sgdisk", "-n2:0:0", "-t2:8300", f"-c2:{label}", str(disk)])
-    run(["partprobe", str(disk)])
-    esp_part, btrfs_part = partition_names(disk)
-    run(["mkfs.fat", "-F32", "-n", f"efi-{label}", esp_part])
-    # NB fs-verity requires this be a verity-capable btrfs (default mkfs is fine
-    # on current btrfs-progs; the kernel enables the feature on first use).
-    run(["mkfs.btrfs", "-f", "-L", label, btrfs_part])
-    return esp_part, btrfs_part
-
-
-def mount_targets(esp_part: str, btrfs_part: str):
-    """Mount the two partitions to temp dirs. Returns (sysroot, efi, cleanup)."""
-    if DRY_RUN:
-        base = Path("/run/zerith-install")
-        log(f"[dry-run] mount {btrfs_part} {base/'sysroot'}")
-        log(f"[dry-run] mount {esp_part} {base/'efi'}")
-        return base / "sysroot", base / "efi", lambda: None
-
-    base = Path(tempfile.mkdtemp(prefix="zerith-install-"))
-    sysroot, efi = base / "sysroot", base / "efi"
-    sysroot.mkdir()
-    efi.mkdir()
-    run(["mount", btrfs_part, str(sysroot)])
-    run(["mount", esp_part, str(efi)])
-
-    def cleanup() -> None:
-        run(["umount", str(efi)])
-        run(["umount", str(sysroot)])
-        shutil.rmtree(base, ignore_errors=True)
-
-    return sysroot, efi, cleanup
-
-
-# --------------------------------------------------------------------------- #
-# Layout initialization (idempotent)
-# --------------------------------------------------------------------------- #
-
-def init_layout(sysroot: Path, efi: Path) -> None:
-    for sub in ("@var", "@home", "@deploy"):
-        path = sysroot / sub
-        if (not DRY_RUN) and path.exists():
-            vlog(f"subvolume {sub} already present")
-            continue
-        run(["btrfs", "subvolume", "create", str(path)])
-
-    deploy = sysroot / "@deploy"
-    for d in (deploy / "shared" / "objects",
-              efi / "zerith"):
-        if DRY_RUN:
-            log(f"[dry-run] mkdir -p {d}")
-        else:
-            d.mkdir(parents=True, exist_ok=True)
-            vlog(f"ensured dir {d}")
-
-
-# --------------------------------------------------------------------------- #
-# OCI ref helpers (oras + cosign)
-# --------------------------------------------------------------------------- #
-
-def cosign_verify(ref: str, identity_re: str | None, issuer: str,
-                  skip: bool) -> None:
-    if skip:
-        log(f"WARNING: skipping signature verification for {ref}")
-        return
-    if not identity_re:
-        die("cosign identity not set (pass --cosign-identity or "
-            "ZERITH_COSIGN_IDENTITY, or --insecure-skip-verify for dev)")
-    require_tool("cosign")
-    run(["cosign", "verify",
-         "--certificate-identity-regexp", identity_re,
-         "--certificate-oidc-issuer", issuer,
-         ref], capture=True)
-    vlog(f"cosign verified {ref}")
-
-
-# --------------------------------------------------------------------------- #
-# Object landing (content-addressed merge into the shared store)
-# --------------------------------------------------------------------------- #
-
-def place_object(tmp: Path, shared: Path, rel: str) -> bool:
-    """Verify a fetched blob's fs-verity digest matches its store path, move it
-    into the shared store, and seal it with fs-verity. Returns False if it was
-    already present (caller skipped the fetch)."""
-    dest = shared / rel
-    if dest.exists():
-        return False
-    want = rel.replace("/", "")          # "ab/cdef…" -> full digest
-    got = measure_file(tmp)
-    if got != want:
-        die(f"object digest mismatch: {rel} (measured {got})")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(tmp, dest)
-    enable_verity(dest)
-    return True
-
-
-def land_objects_from_dir(src_objects: Path, shared: Path) -> None:
-    """Merge a local objects/ tree (e.g. from --local) into the shared store."""
-    count = 0
-    for root, _, files in os.walk(src_objects):
-        for name in files:
-            fp = Path(root) / name
-            rel = str(fp.relative_to(src_objects))
-            dest = shared / rel
-            if dest.exists():
-                continue
-            if DRY_RUN:
-                log(f"[dry-run] place object {rel}")
-                continue
-            tmp = dest.parent / f".{name}.tmp"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(fp, tmp)
-            if place_object(tmp, shared, rel):
-                count += 1
-    vlog(f"landed {count} new object(s) from {src_objects}")
-
-
-# Object store paths are "<2 hex>/<hex…>"; reject anything else so a crafted
-# tar entry can't escape the shared store via path traversal.
-_OBJ_PATH_RE = re.compile(r"^[0-9a-f]{2}/[0-9a-f]{2,}$")
-
-
-def ref_repo(ref: str) -> str:
-    """Strip the tag/digest from an OCI ref, leaving registry/repo (for
-    `oras blob fetch repo@digest`). A colon is a tag separator only in the final
-    path segment, so a registry port (host:5000/repo) is handled correctly."""
-    at = ref.split("@", 1)[0]
-    slash = at.rfind("/")
-    last = at[slash + 1:]
-    if ":" in last:
-        return at[:slash + 1] + last.split(":", 1)[0]
-    return at
-
-
-def _extract_shard(tar_path: Path, shared: Path) -> tuple[int, int]:
-    """Extract one shard tar into the shared store, skipping objects already
-    present and verifying + sealing each new one. Returns (new, already-present)."""
-    new = present = 0
-    with tarfile.open(tar_path) as tf:
-        for m in tf.getmembers():
-            if not m.isfile():
-                continue
-            rel = (m.name[len("objects/"):]
-                   if m.name.startswith("objects/") else m.name)
-            if not _OBJ_PATH_RE.match(rel):
-                continue                       # not an object path; ignore
-            dest = shared / rel
-            if dest.exists():
-                present += 1
-                continue
-            if DRY_RUN:
-                log(f"[dry-run] extract object {rel}")
-                continue
-            extracted = tf.extractfile(m)
-            if extracted is None:
-                continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dest.parent / f".{rel.replace('/', '_')}.tmp"
-            with open(tmp, "wb") as out:
-                shutil.copyfileobj(extracted, out)
-            if place_object(tmp, shared, rel):
-                new += 1
-            else:
-                present += 1
-    return new, present
-
-
-def _land_full(objects_ref: str, shared: Path) -> None:
-    """Pull the whole objects artifact and extract every shard. Used on first
-    install or when no shard digest map is available to diff against."""
-    staging = Path(tempfile.mkdtemp(prefix="zerith-obj-"))
-    try:
-        run(["oras", "pull", objects_ref, "-o", str(staging)])
-        new = present = 0
-        for tarpath in sorted(staging.rglob("*.tar")):
-            a, b = _extract_shard(tarpath, shared)
-            new += a
-            present += b
-        log(f"objects: extracted {new} new, {
-            present} already present (full pull)")
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-
-def land_objects_from_ref(objects_ref: str, shared: Path,
-                          new_shards: dict | None = None,
-                          old_shards: dict | None = None) -> None:
-    """Materialize this deployment's objects into the shared store.
-
-    With both a new and an old shard digest map (prefix -> sha256 blob digest),
-    fetch only the shards whose digest changed — a prefix whose digest matches
-    the currently-installed deployment is already on disk (held by that
-    deployment), so it's skipped on the wire. Without a map (first install, or an
-    older artifact), fall back to pulling the whole artifact."""
-    require_tool("oras")
-    new_shards = new_shards or {}
-    old_shards = old_shards or {}
-    if not (new_shards and old_shards):
-        _land_full(objects_ref, shared)
-        return
-
-    repo = ref_repo(objects_ref)
-    staging = Path(tempfile.mkdtemp(prefix="zerith-obj-"))
-    try:
-        changed = new = present = 0
-        for pfx, digest in sorted(new_shards.items()):
-            if old_shards.get(pfx) == digest:
-                continue                       # bucket unchanged; already on disk
-            changed += 1
-            if DRY_RUN:
-                log(f"[dry-run] oras blob fetch {repo}@{digest} ({pfx})")
-                continue
-            tar_path = staging / f"{pfx}.tar"
-            run(["oras", "blob", "fetch", f"{repo}@{digest}",
-                 "--output", str(tar_path)])
-            a, b = _extract_shard(tar_path, shared)
-            new += a
-            present += b
-        log(f"objects: {changed} changed shard(s) of {len(new_shards)}; "
-            f"extracted {new} new, {present} already present")
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-
-def land_objects_from_pack(objects_ref: str, pack_meta: dict, idx_meta: dict,
-                           shared: Path) -> None:
-    """schema>=2 object landing: fetch the whole pack blob + its index, then
-    explode every object out of the pack into the shared store (verify + seal
-    each). A first install needs every object, so we stream the one pack blob
-    rather than issuing range requests — that's zerithctl's job for incremental
-    updates. place_object re-checks each fs-verity digest before trusting it."""
-    require_tool("oras")
-    repo = ref_repo(objects_ref)
-    staging = Path(tempfile.mkdtemp(prefix="zerith-pack-"))
-    try:
-        packp = staging / "objects.pack"
-        idxp = staging / "objects.index"
-        if DRY_RUN:
-            log(f"[dry-run] oras blob fetch pack {pack_meta.get('digest')}")
-            log(f"[dry-run] oras blob fetch index {idx_meta.get('digest')}")
-            return
-        run(["oras", "blob", "fetch", f"{repo}@{pack_meta['digest']}",
-             "--output", str(packp)])
-        run(["oras", "blob", "fetch", f"{repo}@{idx_meta['digest']}",
-             "--output", str(idxp)])
-        raw = idxp.read_bytes()
-        if idx_meta.get("encoding") == "gzip":
-            raw = gzip.decompress(raw)
-        new = present = 0
-        with open(packp, "rb") as pack:
-            for line in raw.decode().splitlines():
-                if not line:
-                    continue
-                dg, off, ln = line.split()
-                rel = f"{dg[:2]}/{dg[2:]}"
-                dest = shared / rel
-                if dest.exists():
-                    present += 1
-                    continue
-                pack.seek(int(off))
-                data = pack.read(int(ln))
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                tmp = dest.parent / f".{dg}.tmp"
-                with open(tmp, "wb") as out:
-                    out.write(data)
-                if place_object(tmp, shared, rel):
-                    new += 1
-                else:
-                    present += 1
-        log(f"objects: landed {new} new, {present} already present (pack)")
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
-
-# --------------------------------------------------------------------------- #
-# Source resolution (oras artifact OR local CI output dir)
-# --------------------------------------------------------------------------- #
-
-class Source:
-    def __init__(self, staging: Path, meta: dict, *, ref: str | None,
-                 objects_ref: str | None, local_objects: Path | None,
-                 cleanup=None):
-        self.staging = staging          # dir holding zerith.efi, root.cfs, meta
-        self.meta = meta
-        self.ref = ref
-        self.objects_ref = objects_ref
-        self.local_objects = local_objects
-        self._cleanup = cleanup
-
-    @property
-    def uki(self) -> Path:
-        return self.staging / UKI_NAME
-
-    @property
-    def root_cfs(self) -> Path:
-        return self.staging / CFS_NAME
-
-    @property
-    def bootloader(self) -> Path:
-        return self.staging / "BOOTX64.EFI"
-
-    @property
-    def deploy_id(self) -> str:
-        return self.meta["deploy_id"]
-
-    @property
-    def version(self) -> str:
-        return self.meta.get("version", "unknown")
-
-    @property
-    def digest(self) -> str:
-        return self.meta["composefs_digest"]
-
-    @property
-    def object_shards(self) -> dict:
-        return self.meta.get("object_shards", {}) or {}
-
-    @property
-    def objects_pack(self) -> dict:
-        """schema>=2: {digest, size} of the single concatenated pack blob."""
-        return self.meta.get("objects_pack") or {}
-
-    @property
-    def objects_index(self) -> dict:
-        """schema>=2: {digest, size, encoding} of the digest->offset index."""
-        return self.meta.get("objects_index") or {}
-
-    def cleanup(self) -> None:
-        if self._cleanup:
-            self._cleanup()
-
-
-def _read_meta(staging: Path) -> dict:
-    if DRY_RUN and not (staging / META_NAME).is_file():
-        return {"deploy_id": "dryrunid00000000", "version": "unknown",
-                "composefs_digest": "0" * 64, "objects_ref": None}
-    try:
-        return json.loads((staging / META_NAME).read_text())
-    except (OSError, ValueError) as e:
-        die(f"bad or missing {META_NAME} in source: {e}")
-
-
-def source_from_ref(ref: str, cos_id: str | None, cos_issuer: str,
-                    skip_verify: bool) -> Source:
-    require_tool("oras")
-    cosign_verify(ref, cos_id, cos_issuer, skip_verify)
-    staging = Path(tempfile.mkdtemp(prefix="zerith-pull-"))
-    run(["oras", "pull", ref, "-o", str(staging)])
-    meta = _read_meta(staging)
-    return Source(staging, meta, ref=ref,
-                  objects_ref=meta.get("objects_ref"),
-                  local_objects=None,
-                  cleanup=lambda: shutil.rmtree(staging, ignore_errors=True))
-
-
-def source_from_local(local: Path) -> Source:
-    if not DRY_RUN and not local.is_dir():
-        die(f"--local {local} is not a directory")
-    meta = _read_meta(local)
-    objs = local / "objects"
-    if not DRY_RUN and not objs.is_dir():
-        die(f"--local {local} has no objects/ directory")
-    return Source(local, meta, ref=None, objects_ref=None, local_objects=objs)
-
-
-# --------------------------------------------------------------------------- #
-# Deployment roles (symlinks) + per-deployment metadata
-# --------------------------------------------------------------------------- #
-
-META_SCHEMA = 2
-
-
-def deploy_root(sysroot: Path) -> Path:
-    return sysroot / "@deploy"
-
-
-def write_deployment_meta(deploy_dir: Path, src: Source) -> None:
-    meta = {
-        "schema": META_SCHEMA,
-        "deploy_id": src.deploy_id,
-        "version": src.version,
-        "composefs_digest": src.digest,
-        "objects_ref": src.objects_ref,
-        "object_shards": src.object_shards,
-        "objects_pack": src.objects_pack,
-        "objects_index": src.objects_index,
-        "ref": src.ref,
-        "deployed_at": now(),
-    }
-    path = deploy_dir / "deployment.json"
-    if DRY_RUN:
-        log(f"[dry-run] write {path}")
-        vlog(json.dumps(meta, indent=2))
-        return
-    path.write_text(json.dumps(meta, indent=2) + "\n")
-    vlog(f"wrote {path}")
-
-
-def set_role(sysroot: Path, role: str, deploy_id: str) -> None:
-    root = deploy_root(sysroot)
-    link = root / role
-    if DRY_RUN:
-        log(f"[dry-run] ln -sfn {deploy_id} {link}")
-        return
-    tmp = root / f".{role}.tmp"
-    if tmp.is_symlink() or tmp.exists():
-        tmp.unlink()
-    tmp.symlink_to(deploy_id)
-    os.replace(tmp, link)
-    vlog(f"role {role} -> {deploy_id}")
-
-
-def write_source_config(sysroot: Path, ref: str) -> None:
-    """Seed the update channel (zerithctl reads @deploy/source.conf). The
-    channel is the deployment artifact ref `update` will pull."""
-    path = deploy_root(sysroot) / "source.conf"
-    data = {"schema": 1, "ref": ref, "updated_at": now()}
-    if DRY_RUN:
-        log(f"[dry-run] write {path} (ref={ref})")
-        return
-    path.write_text(json.dumps(data, indent=2) + "\n")
-    vlog(f"update channel -> {ref}")
-
-
-# --------------------------------------------------------------------------- #
-# Bootloader config — STATIC, written once
-# --------------------------------------------------------------------------- #
-
-LIMINE_CONF = """\
-timeout: 3
-default_entry: 1
-
-/Zerith
-    protocol: efi_chainload
-    path: boot():/zerith/current.efi
-
-/Zerith (previous)
-    protocol: efi_chainload
-    path: boot():/zerith/fallback.efi
-"""
-
-
-def write_limine(efi: Path) -> None:
-    """Write the static two-entry limine.conf, once. Updates never touch it.
-
-    NOTE: verify keys/paths against your Limine version — syntax has changed
-    across releases. With a signed UKI + Secure Boot, editing the baked cmdline
-    at the menu breaks the signature, so the pinned composefs.digest can't be
-    stripped at boot.
-    """
-    path = efi / "limine.conf"
-    if DRY_RUN:
-        log(f"[dry-run] write {path} (static current/fallback)")
-        vlog(LIMINE_CONF)
-        return
-    if path.exists():
-        vlog(f"{path} already present, leaving it")
-        return
-    path.write_text(LIMINE_CONF)
-    vlog(f"wrote {path}")
-
-
-# --------------------------------------------------------------------------- #
-# Limine installation
-# --------------------------------------------------------------------------- #
-
-EFI_LABEL = "Zerith Boot Manager"
-
-
-def esp_block_device(efi: Path) -> str | None:
-    def unescape(p: str) -> str:
-        return (p.replace(r"\040", " ").replace(r"\011", "\t")
-                 .replace(r"\012", "\n").replace(r"\134", "\\"))
-
-    target = os.path.realpath(str(efi))
-    found: str | None = None
-    for line in Path("/proc/mounts").read_text().splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[0].startswith("/dev/"):
-            if os.path.realpath(unescape(parts[1])) == target:
-                found = parts[0]
-    return found
-
-
-def disk_and_partnum(part_dev: str) -> tuple[str, str] | None:
-    name = os.path.basename(part_dev)
-    sysblk = Path("/sys/class/block") / name
-    pfile = sysblk / "partition"
-    if not pfile.is_file():
-        return None
-    part_num = pfile.read_text().strip()
-    parent = os.path.basename(os.path.dirname(os.path.realpath(str(sysblk))))
-    return (f"/dev/{parent}", part_num) if parent else None
-
-
-def install_limine(efi: Path, disk: Path | None = None,
-                   esp_part: str | None = None,
-                   loader_src: Path | None = None) -> None:
-    if DRY_RUN:
-        log("[dry-run] install Limine (copy loader + efibootmgr entry)")
-        return
-
-    # Prefer the Secure Boot-signed loader shipped in the deployment artifact;
-    # fall back to the local (unsigned) package copy only if it wasn't shipped.
-    if loader_src is not None and loader_src.is_file():
-        limine_src = str(loader_src)
-    else:
-        limine_src = "/usr/share/limine/BOOTX64.EFI"
-        log("warning: using local Limine loader (unsigned) — Secure Boot will "
-            "reject it unless you've signed it out of band")
-    if not os.path.isfile(limine_src):
-        log(f"warning: Limine EFI loader not found at {limine_src}, skipping")
-        return
-
-    # Install to the removable-media fallback path: it lives on the disk, so it
-    # boots in any firmware without an NVRAM entry (survives firmware resets,
-    # board swaps, and boots in a VM). Zerith owns the disk, so there's no other
-    # fallback loader to clobber.
-    dest_dir = efi / "EFI" / "BOOT"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(limine_src, dest_dir / "BOOTX64.EFI")
-    vlog(f"copied Limine loader to {dest_dir / 'BOOTX64.EFI'}")
-
-    part_num: str | None = None
-    if esp_part is not None:
-        m = re.search(r'p?(\d+)$', esp_part)
-        part_num = m.group(1) if m else None
-    if disk is None or part_num is None:
-        dev = esp_block_device(efi)
-        resolved = disk_and_partnum(dev) if dev else None
-        if resolved:
-            if disk is None:
-                disk = Path(resolved[0])
-            if part_num is None:
-                part_num = resolved[1]
-
-    # The loader above already boots via the fallback path. The NVRAM entry
-    # below is a best-effort bonus: a labelled "Zerith Boot Manager" option that
-    # ranks above other fallbacks. If we can't make it (no efivars, no
-    # efibootmgr, can't resolve the disk), the system still boots from the
-    # fallback path — so these are warnings, not failures.
-    if disk is None or part_num is None:
-        log("note: could not resolve ESP disk/partition; booting via the "
-            "fallback path only (no labelled NVRAM entry)")
-        return
-
-    if not shutil.which("efibootmgr"):
-        log("note: efibootmgr not found; booting via the fallback path only")
-        return
-    if not os.path.exists("/sys/firmware/efi/efivars"):
-        log("note: efivars not mounted; booting via the fallback path only")
-        return
-
-    if EFI_LABEL in run(["efibootmgr"], capture=True):
-        vlog(f"UEFI boot entry {EFI_LABEL!r} already present, leaving it")
-        return
-
-    run([
-        "efibootmgr",
-        "--create",
-        "--disk", str(disk),
-        "--part", part_num,
-        "--label", EFI_LABEL,
-        "--loader", r"\EFI\BOOT\BOOTX64.EFI",
-        "--unicode",
-    ])
-    log("Limine boot entry created")
-
-
-# --------------------------------------------------------------------------- #
-# Deploy
-# --------------------------------------------------------------------------- #
-
-def deploy(sysroot: Path, efi: Path, src: Source) -> None:
-    shared = sysroot / "@deploy" / "shared" / "objects"
-    deploy_dir = sysroot / "@deploy" / src.deploy_id
-    holder = deploy_dir / "objects"
-    root_cfs = deploy_dir / "root.cfs"
-    btrfs_uki = deploy_dir / "zerith.efi"          # per-deployment source of truth
-    esp_uki = efi / "zerith" / "current.efi"       # fixed role-named bootable copy
-
-    if (not DRY_RUN) and deploy_dir.exists():
-        die(f"deployment {src.deploy_id} already installed at {deploy_dir}")
-
-    if DRY_RUN:
-        log(f"[dry-run] mkdir -p {deploy_dir}")
-    else:
-        deploy_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Land objects into the SHARED content-addressed store (verify + seal).
-    if src.local_objects is not None:
-        land_objects_from_dir(src.local_objects, shared)
-    elif src.objects_ref and src.objects_pack:
-        # schema>=2: one pack blob + index. First install pulls the whole pack.
-        land_objects_from_pack(src.objects_ref, src.objects_pack,
-                               src.objects_index, shared)
-    elif src.objects_ref:
-        land_objects_from_ref(src.objects_ref, shared, src.object_shards, {})
-    else:
-        die("no object source (neither local objects/ nor objects_ref)")
-
-    # 2. Place root.cfs, seal it, and verify its digest matches the signed value.
-    if DRY_RUN:
-        log(f"[dry-run] cp {src.root_cfs} -> {root_cfs}; verify digest {src.digest}")
-    else:
-        shutil.copy2(src.root_cfs, root_cfs)
-        enable_verity(root_cfs)
-        got = measure_file(root_cfs)
-        if got != src.digest:
-            die(f"root.cfs digest mismatch: expected {src.digest}, got {got}")
-        vlog("root.cfs digest verified against signed deployment metadata")
-
-    # 3. Per-deployment hardlink holder for GC (link only this image's objects).
-    if DRY_RUN:
-        log(f"[dry-run] hardlink referenced objects into {holder}")
-    else:
-        _link_holder(shared, holder, root_cfs)
-
-    # 4. Install the (signed) UKI alongside the deployment and onto the ESP.
-    if DRY_RUN:
-        log(f"[dry-run] cp {src.uki} -> {btrfs_uki}")
-        log(f"[dry-run] cp {src.uki} -> {esp_uki}")
-    else:
-        shutil.copy2(src.uki, btrfs_uki)
-        esp_uki.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src.uki, esp_uki)
-        vlog(f"installed UKI -> {esp_uki}")
-
-    write_deployment_meta(deploy_dir, src)
-    set_role(sysroot, "current", src.deploy_id)
-    if src.ref:                                   # seed the update channel
-        write_source_config(sysroot, src.ref)
-    write_limine(efi)
-
-    log(f"installed deployment {src.deploy_id} "
-        f"(version {src.version}) as current")
-
-
-_DIGEST_RE = re.compile(r"\b[0-9a-f]{64}\b")
-
-
-def _link_holder(shared: Path, holder: Path, root_cfs: Path) -> None:
-    """Hardlink exactly this deployment's objects from the shared store into its
-    private holder dir, so GC's link-count test stays honest. Requires
-    composefs-info to enumerate the image's referenced objects."""
-    require_tool("composefs-info")
-    dump = run(["composefs-info", "dump", str(root_cfs)], capture=True)
-    holder.mkdir(parents=True, exist_ok=True)
-    linked = 0
-    for d in set(_DIGEST_RE.findall(dump)):
-        rel = f"{d[:2]}/{d[2:]}"
-        src = shared / rel
-        if not src.is_file():
-            continue
-        dst = holder / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.link(src, dst)
-            linked += 1
-        except FileExistsError:
-            pass
-    vlog(f"holder: linked {linked} object(s) for this deployment")
-
-
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
-
-def main(argv: list[str] | None = None) -> int:
-    global DRY_RUN, VERBOSE
-
-    p = argparse.ArgumentParser(
-        prog="install-zerith",
-        description="Partition (optional), initialize, and install Zerith "
-                    "from a signed OCI deployment artifact.",
-    )
-    p.add_argument("sysroot", nargs="?", type=Path,
-                   help="mountpoint of the target btrfs (omit when using --disk)")
-    p.add_argument("efi", nargs="?", type=Path,
-                   help="mountpoint of the ESP (omit when using --disk)")
-
-    p.add_argument("--disk", type=Path,
-                   help="whole disk to auto-partition, e.g. /dev/nvme0n1 (DESTROYS it)")
-    p.add_argument("--yes", action="store_true",
-                   help="skip the wipe confirmation")
-    p.add_argument("--esp-size", default=DEFAULT_ESP_SIZE,
-                   help="ESP size (default 1GiB)")
-    p.add_argument("--label", default=DEFAULT_LABEL,
-                   help="btrfs label; MUST match the init's LABEL= (default zerith)")
-
-    # Source: exactly one of --ref (oras) / --local (CI output dir).
-    p.add_argument("--ref", help="signed OCI deployment artifact ref to pull")
-    p.add_argument("--local", type=Path,
-                   help="local CI output dir (zerith.efi, root.cfs, "
-                        "deployment.json, objects/) for offline installs")
-
-    # cosign trust policy.
-    p.add_argument("--cosign-identity",
-                   default=os.environ.get("ZERITH_COSIGN_IDENTITY"),
-                   help="cosign --certificate-identity-regexp "
-                        "(env ZERITH_COSIGN_IDENTITY)")
-    p.add_argument("--cosign-issuer",
-                   default=os.environ.get("ZERITH_COSIGN_ISSUER",
-                                          DEFAULT_COSIGN_ISSUER),
-                   help="cosign --certificate-oidc-issuer")
-    p.add_argument("--insecure-skip-verify", action="store_true",
-                   help="DEV ONLY: skip cosign verification")
-
-    p.add_argument("--no-limine", action="store_true",
-                   help="skip installing the Limine bootloader (efibootmgr)")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("-v", "--verbose", action="store_true")
-
-    args = p.parse_args(argv)
-    DRY_RUN = args.dry_run
-    VERBOSE = args.verbose
-
-    if args.disk and (args.sysroot or args.efi):
-        die("give either --disk OR sysroot+efi, not both")
-    if not args.disk and not (args.sysroot and args.efi):
-        die("provide --disk DEV, or both sysroot and efi mountpoints")
-
-    if bool(args.ref) == bool(args.local):
-        die("provide exactly one source: --ref REF  or  --local DIR")
-
-    require_root()
-
-    if args.disk:
-        assert_disk_free(args.disk)
-        confirm_wipe(args.disk, args.yes)
-        esp_part, btrfs_part = partition_disk(
-            args.disk, args.esp_size, args.label)
-        sysroot, efi, unmount = mount_targets(esp_part, btrfs_part)
-        limine_disk, limine_part = args.disk, esp_part
-    else:
-        sysroot, efi, unmount = args.sysroot, args.efi, (lambda: None)
-        limine_disk, limine_part = None, None
-
-    try:
-        init_layout(sysroot, efi)
-        if args.ref:
-            src = source_from_ref(args.ref, args.cosign_identity,
-                                  args.cosign_issuer, args.insecure_skip_verify)
-        else:
-            src = source_from_local(args.local)
-        try:
-            deploy(sysroot, efi, src)
-            # Install Limine from the (signed) loader shipped in the artifact, so
-            # the firmware -> Limine -> UKI chain is signed end to end.
-            if not args.no_limine:
-                install_limine(efi, limine_disk, limine_part, src.bootloader)
-        finally:
-            src.cleanup()
-    finally:
-        unmount()
-
-    log("done.")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+# Zerith bootstrap installer.
+#
+# A thin wrapper that prepares the environment and then hands the real work to
+# `zerithctl install`. It can be run straight from a checkout or piped from the
+# web:
+#
+#     curl -fsSL https://raw.githubusercontent.com/Zerith-Linux/Zerith/main/install | sudo bash
+#
+# It (1) ensures it is running as root, (2) makes sure the tools the installer
+# needs are on PATH, (3) obtains the `zerithctl` package (using the checkout it
+# lives in, or fetching one), (4) picks a target disk interactively when none is
+# given, and (5) execs `zerithctl install`. All install logic — partitioning,
+# layout, landing, promotion — lives in zerithctl; see docs/deployment.md.
+set -euo pipefail
+
+# --- Configuration (override via environment) --------------------------------
+ZERITH_REF="${ZERITH_REF:-ghcr.io/zerith-linux/zerith:latest}"
+ZERITH_REPO="${ZERITH_REPO:-https://github.com/Zerith-Linux/Zerith}"
+ZERITH_BRANCH="${ZERITH_BRANCH:-main}"
+ZERITH_DISK="${ZERITH_DISK:-}"
+ZERITH_INSECURE="${ZERITH_INSECURE:-}"   # set to skip cosign verification (dev)
+ZERITH_YES="${ZERITH_YES:-}"             # set to skip the wipe confirmation
+
+# Tools the installer shells out to. Missing ones are installed with pacman when
+# available, otherwise reported so the user can add them by hand.
+REQUIRED_TOOLS=(python3 oras cosign fsverity mkfs.btrfs mkfs.fat sgdisk
+                partprobe mount umount composefs-info curl)
+
+say()  { printf 'install-zerith: %s\n' "$*"; }
+warn() { printf 'install-zerith: warning: %s\n' "$*" >&2; }
+die()  { printf 'install-zerith: error: %s\n' "$*" >&2; exit 1; }
+
+# --- 1. Ensure root ----------------------------------------------------------
+ensure_root() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    command -v sudo >/dev/null 2>&1 || die "not root and sudo not found"
+    say "re-running under sudo"
+    exec sudo -E bash "$0" "$@"
+}
+
+# --- 2. Ensure the required tools are present --------------------------------
+ensure_tools() {
+    local missing=()
+    local tool
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+
+    say "missing tools: ${missing[*]}"
+    if command -v pacman >/dev/null 2>&1; then
+        say "installing them with pacman"
+        # Map tool names to the Arch packages that provide them.
+        pacman -Sy --noconfirm --needed \
+            python btrfs-progs dosfstools gptfdisk util-linux composefs \
+            fsverity-utils curl oras cosign || \
+            warn "pacman could not install everything; continuing anyway"
+    else
+        warn "no pacman here — install these yourself before continuing: ${missing[*]}"
+    fi
+}
+
+# --- 3. Locate or fetch the zerithctl package --------------------------------
+# Prints the directory that contains the `zerithctl` script.
+locate_tool() {
+    local here
+    here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+    if [ -f "$here/zerithctl" ] && [ -d "$here/zerith" ]; then
+        echo "$here"
+        return 0
+    fi
+    # Piped from the web with no checkout: fetch one.
+    local dest
+    dest="$(mktemp -d /tmp/zerith-tool.XXXXXX)"
+    if command -v git >/dev/null 2>&1; then
+        git clone --depth 1 --branch "$ZERITH_BRANCH" "$ZERITH_REPO" "$dest" \
+            >/dev/null 2>&1 || die "failed to clone $ZERITH_REPO"
+    else
+        command -v curl >/dev/null 2>&1 || die "need git or curl to fetch the tool"
+        curl -fsSL "$ZERITH_REPO/archive/refs/heads/$ZERITH_BRANCH.tar.gz" \
+            | tar -xz -C "$dest" --strip-components=1 \
+            || die "failed to download the tool tarball"
+    fi
+    echo "$dest"
+}
+
+# --- 4. Pick a target disk interactively -------------------------------------
+# Sets the global TARGET_DISK. Reads choices from the terminal even when the
+# script itself arrived on stdin (curl | bash).
+choose_disk() {
+    if [ -n "$ZERITH_DISK" ]; then
+        TARGET_DISK="$ZERITH_DISK"
+        return 0
+    fi
+    [ -r /dev/tty ] || die "no disk given (set ZERITH_DISK) and no terminal to ask on"
+
+    mapfile -t disks < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print $1}')
+    [ "${#disks[@]}" -gt 0 ] || die "no disks found"
+
+    say "select the disk to install Zerith onto (ALL DATA WILL BE ERASED):"
+    local i
+    for i in "${!disks[@]}"; do
+        printf '  [%d] %s\n' "$((i + 1))" \
+            "$(lsblk -dn -o NAME,SIZE,MODEL "/dev/${disks[$i]}")" >/dev/tty
+    done
+
+    local choice
+    while :; do
+        printf 'install-zerith: number (or q to quit): ' >/dev/tty
+        read -r choice </dev/tty || die "aborted"
+        [ "$choice" = "q" ] && die "aborted"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && \
+           [ "$choice" -ge 1 ] && [ "$choice" -le "${#disks[@]}" ]; then
+            TARGET_DISK="/dev/${disks[$((choice - 1))]}"
+            return 0
+        fi
+        warn "invalid choice"
+    done
+}
+
+# --- 5. Hand off to zerithctl install ----------------------------------------
+main() {
+    ensure_root "$@"
+    ensure_tools
+
+    local tool_dir
+    tool_dir="$(locate_tool)"
+    say "using zerithctl from $tool_dir"
+
+    local args=(install --ref "$ZERITH_REF")
+    [ -n "$ZERITH_INSECURE" ] && args+=(--insecure-skip-verify)
+    [ -n "$ZERITH_YES" ] && args+=(--yes)
+
+    # Two modes: existing mountpoints (sysroot + efi), or a whole disk.
+    if [ "$#" -eq 2 ]; then
+        say "installing onto existing partitions: sysroot=$1 efi=$2"
+        args+=("$1" "$2")
+    else
+        choose_disk
+        say "installing onto $TARGET_DISK"
+        args+=(--disk "$TARGET_DISK")
+    fi
+
+    exec python3 "$tool_dir/zerithctl" "${args[@]}"
+}
+
+main "$@"

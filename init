@@ -1,10 +1,15 @@
 #!/bin/sh
 # Zerith initramfs init: bring up the composefs root with writable state, then
-# hand off to the real init. Any failure drops to a rescue shell.
+# hand off to the real init. Any failure drops to a rescue shell. The boot chain
+# and integrity model are documented in docs/boot.md.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
 
-die()   { echo "FATAL: $*"; exec sh; }
-retry() {                       # retry <tries> <cmd...> — returns 0 once cmd succeeds
+BOOTDEV="LABEL=zerith"
+
+die() { echo "FATAL: $*"; exec sh; }
+
+# retry <tries> <cmd...> — run cmd until it succeeds or tries run out.
+retry() {
     tries="$1"; shift
     while ! "$@"; do
         tries=$((tries - 1))
@@ -13,83 +18,100 @@ retry() {                       # retry <tries> <cmd...> — returns 0 once cmd 
     done
 }
 
-# --- API filesystems + console -------------------------------------------------
-mount -t proc     proc  /proc
-mount -t sysfs    sysfs /sys
-mount -t devtmpfs dev   /dev
-exec < /dev/console > /dev/console 2>&1
+mount_api_filesystems() {
+    mount -t proc     proc  /proc
+    mount -t sysfs    sysfs /sys
+    mount -t devtmpfs dev   /dev
+    exec < /dev/console > /dev/console 2>&1
+}
 
-# --- storage + filesystem drivers ----------------------------------------------
-# vmd before nvme so an SSD behind Intel VMD/RST is found; the rest cover
-# NVMe/SATA/USB/eMMC. Builtin or absent modules report "not found" harmlessly.
-for m in virtio_pci virtio_blk vmd nvme ahci sd_mod \
-         usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block \
-         fat vfat ext4 btrfs loop erofs overlay; do
-    modprobe "$m" >/dev/null 2>&1
-done
+# Load storage + filesystem drivers, then confirm the ones we cannot boot
+# without are available. vmd loads before nvme so an SSD behind Intel VMD/RST is
+# found. Built-in or absent modules report "not found" harmlessly.
+load_drivers() {
+    for m in virtio_pci virtio_blk vmd nvme ahci sd_mod \
+             usb_storage uas xhci_pci ehci_pci sdhci_pci mmc_block \
+             fat vfat ext4 btrfs loop erofs overlay; do
+        modprobe "$m" >/dev/null 2>&1
+    done
 
-fs_ready() { grep -q "[[:space:]]$1\$" /proc/filesystems; }
-for fs in erofs overlay; do
-    retry 5 fs_ready "$fs" || die "$fs never registered"
-done
-[ -e /dev/loop-control ] || die "loop not available"
+    fs_ready() { grep -q "[[:space:]]$1\$" /proc/filesystems; }
+    for fs in erofs overlay; do
+        retry 5 fs_ready "$fs" || die "$fs never registered"
+    done
+    [ -e /dev/loop-control ] || die "loop not available"
+}
 
-# --- pick deploy, read the pinned root digest, locate the boot device ----------
-BOOTDEV="LABEL=zerith"
-for arg in $(cat /proc/cmdline); do
-    case "$arg" in
-        deploy=*)           deploy="${arg#deploy=}" ;;
-        composefs.digest=*) cfsdigest="${arg#composefs.digest=}" ;;
-    esac
-done
-[ -n "$deploy" ]    || die "deploy= missing from kernel cmdline"
-# The digest is the anchor for the whole integrity chain — refuse to boot blind.
-[ -n "$cfsdigest" ] || die "composefs.digest= missing from kernel cmdline"
+# Read the deploy id and pinned composefs digest from the signed kernel cmdline.
+# The digest anchors the whole integrity chain, so we refuse to boot without it.
+parse_cmdline() {
+    # Kernel args are space-separated tokens, so word-splitting is intended.
+    # shellcheck disable=SC2013
+    for arg in $(cat /proc/cmdline); do
+        case "$arg" in
+            deploy=*)           deploy="${arg#deploy=}" ;;
+            composefs.digest=*) cfsdigest="${arg#composefs.digest=}" ;;
+        esac
+    done
+    [ -n "$deploy" ]    || die "deploy= missing from kernel cmdline"
+    [ -n "$cfsdigest" ] || die "composefs.digest= missing from kernel cmdline"
+}
 
-resolve_dev() { DEV="$(findfs "$BOOTDEV" 2>/dev/null)"; [ -b "$DEV" ]; }
-retry 20 resolve_dev || die "$BOOTDEV not found"
+# Locate and mount the btrfs top-level subvol; the deployment store lives under
+# its "@deploy" directory.
+mount_boot_device() {
+    resolve_dev() { DEV="$(findfs "$BOOTDEV" 2>/dev/null)"; [ -b "$DEV" ]; }
+    retry 20 resolve_dev || die "$BOOTDEV not found"
+    mkdir -p /mnt /sysroot
+    mount "$DEV" /mnt || die "mount $DEV failed"
+    BASE="/mnt/@deploy/$deploy"
+}
 
-mkdir -p /mnt /sysroot
-mount "$DEV" /mnt || die "mount $DEV failed"
-# /mnt is the top-level subvol; the deployment store lives in the @deploy
-# subvol, which appears here as the directory "@deploy".
-BASE="/mnt/@deploy/$deploy"
+# Assemble the read-only composefs root. composefs needs a real loop device and
+# there is no udev here to make one, so priming an erofs loop mount first nudges
+# the kernel into setting one up. digest= pins the image to the signed value;
+# verity requires every backing object to carry its recorded fs-verity digest.
+mount_composefs_root() {
+    mkdir -p /tmp/prime
+    mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
+    mount.composefs "$BASE/root.cfs" /sysroot \
+        -o basedir=/mnt/@deploy/shared/objects,digest="$cfsdigest",verity \
+        || die "composefs mount failed (digest/verity mismatch — refusing to boot)"
 
-# --- composefs root ------------------------------------------------------------
-# composefs needs a real loop device and there's no udev here to make one;
-# priming an erofs loop mount first gets the kernel to set one up.
-mkdir -p /tmp/prime
-mount -t erofs -o loop "$BASE/root.cfs" /tmp/prime
-# digest=  -> the image's own fs-verity digest must equal the signed value.
-# verity   -> every backing object must carry the fs-verity digest recorded in
-#             the image, or the open is refused by the kernel.
-mount.composefs "$BASE/root.cfs" /sysroot \
-    -o basedir=/mnt/@deploy/shared/objects,digest="$cfsdigest",verity \
-    || die "composefs mount failed (digest/verity mismatch — refusing to boot)"
+    EFIDEV="$(findfs LABEL=efi-zerith 2>/dev/null)"
+    [ -n "$EFIDEV" ] && [ -b "$EFIDEV" ] || die "EFI partition not found"
+    mount -t vfat "$EFIDEV" /sysroot/efi || die "EFI mount failed"
+}
 
-EFIDEV="$(findfs LABEL=efi-zerith 2>/dev/null)"
-[ -n "$EFIDEV" ] && [ -b "$EFIDEV" ] || die "EFI partition not found"
+# Layer the writable state on top of the read-only root: persistent subvolumes,
+# a first-boot factory seed for /var, and the /etc overlay (upper on @var so
+# edits survive image updates).
+mount_writable_state() {
+    mount -t btrfs -o subvol=@var    "$DEV" /sysroot/var    || die "var mount failed"
+    mount -t btrfs -o subvol=@home   "$DEV" /sysroot/home   || die "home mount failed"
+    mount -t btrfs -o subvol=@deploy "$DEV" /sysroot/deploy || die "deploy mount failed"
 
-mount -t vfat "$EFIDEV" /sysroot/efi || die "EFI mount failed"
+    if [ -z "$(ls -A /sysroot/var 2>/dev/null)" ]; then
+        echo "seeding /var from factory"
+        cp -a /sysroot/usr/share/factory/var/. /sysroot/var/
+    fi
 
-# --- writable state (mount /var before the /etc overlay) -----------------------
-mount -t btrfs -o subvol=@var  "$DEV" /sysroot/var  || die "var mount failed"
-mount -t btrfs -o subvol=@home "$DEV" /sysroot/home || die "home mount failed"
-mount -t btrfs -o subvol=@deploy "$DEV" /sysroot/deploy || die "deploy mount failed"
+    mkdir -p /sysroot/var/lib/etc/upper /sysroot/var/lib/etc/work
+    mount -t overlay overlay /sysroot/etc \
+        -o lowerdir=/sysroot/usr/etc,upperdir=/sysroot/var/lib/etc/upper,workdir=/sysroot/var/lib/etc/work \
+        || die "etc overlay failed"
+}
 
-# first boot / factory reset: seed an empty @var from the read-only factory copy
-if [ -z "$(ls -A /sysroot/var 2>/dev/null)" ]; then
-    echo "seeding /var from factory"
-    cp -a /sysroot/usr/share/factory/var/. /sysroot/var/
-fi
+handoff() {
+    mount -o bind /dev /sysroot/dev
+    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /sysroot/run
+    exec switch_root /sysroot /sbin/init
+}
 
-# /etc overlay: upper/work live on @var so edits survive cascade updates
-mkdir -p /sysroot/var/lib/etc/upper /sysroot/var/lib/etc/work
-mount -t overlay overlay /sysroot/etc \
-    -o lowerdir=/sysroot/usr/etc,upperdir=/sysroot/var/lib/etc/upper,workdir=/sysroot/var/lib/etc/work \
-    || die "etc overlay failed"
-
-# --- hand off ------------------------------------------------------------------
-mount -o bind /dev /sysroot/dev
-mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /sysroot/run
-exec switch_root /sysroot /sbin/init
+mount_api_filesystems
+load_drivers
+parse_cmdline
+mount_boot_device
+mount_composefs_root
+mount_writable_state
+handoff

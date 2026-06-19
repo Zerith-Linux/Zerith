@@ -12,6 +12,7 @@ on:
     branches: ['*']
     paths-ignore:
       - '**/README.md'
+      - 'docs/**'
       - 'releases.json'
 
   workflow_dispatch:
@@ -78,7 +79,7 @@ jobs:
         id: deploy_id
         run: echo "id=${GITHUB_SHA:0:8}$(openssl rand -hex 4)" >> "$GITHUB_OUTPUT"
 
-      # ---- 1. Build the rootfs image (no UKI inside it any more) --------------
+      # 1. Build the rootfs image (no UKI inside it any more).
       - name: Build Image
         id: build_image
         uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2
@@ -91,124 +92,23 @@ jobs:
             DEPLOY_ID=${{ steps.deploy_id.outputs.id }}
           oci: false
 
-      # ---- 2. Post-process the rootfs (immutable layout: /usr/etc, factory var)
+      # 2. Post-process the rootfs into the immutable layout (/usr/etc, factory /var).
       - name: Post-process rootfs
-        run: |
-          set -e
-          buildah unshare bash -c '
-            set -e
-            ctr=$(buildah from containers-storage:localhost/${{ env.IMAGE_NAME }}:localbuild)
-            mnt=$(buildah mount "$ctr")
+        run: buildah unshare scripts/ci/post-process-rootfs.sh
 
-            # Clean runtime/cache data
-            rm -rf \
-                "$mnt"/var/lib/pacman/sync/* \
-                "$mnt"/var/tmp/* \
-                "$mnt"/var/lib/dbus/machine-id
-            find "$mnt/var/cache" "$mnt/var/log" -type f -delete 2>/dev/null || true
-
-            # Rootfs layout: roothome/srv live under factory /var
-            rm -rf "$mnt/root" "$mnt/srv"
-            mkdir -p "$mnt/var/roothome" "$mnt/var/srv"
-            ln -sfn var/roothome "$mnt/root"
-            ln -sfn var/srv      "$mnt/srv"
-
-            # Preserve factory defaults: capture /var, relocate /etc -> /usr/etc
-            mkdir -p "$mnt/usr/share/factory"
-            cp -a "$mnt/var" "$mnt/usr/share/factory/var"
-            mkdir -p "$mnt/usr/etc"
-            cp -a "$mnt/etc/." "$mnt/usr/etc/"
-            rm -f "$mnt/usr/etc/machine-id"
-
-            # Blank the mutable dirs back to empty mountpoints
-            for d in etc var home dev proc sys run tmp mnt efi deploy; do
-                rm -rf "$mnt/$d"
-                mkdir -p "$mnt/$d"
-            done
-            chmod 1777 "$mnt/tmp"
-
-            buildah unmount "$ctr"
-            buildah commit "$ctr" post-processed
-            buildah rm "$ctr"
-          '
-
-      # ---- 3. Export the post-processed rootfs to a plain directory -----------
+      # 3. Export the post-processed rootfs to a plain directory.
       - name: Export rootfs
-        run: |
-          set -e
-          mkdir -p rootfs
-          cid=$(podman create localhost/post-processed)
-          podman export "$cid" | sudo tar -x -C rootfs
-          podman rm "$cid"
+        run: scripts/ci/export-rootfs.sh
 
-      # ---- 4. Render composefs, pin its digest, build + sign the UKI ----------
-      # Runs as REAL root (sudo -E): mkcomposefs must read root-only files like
-      # credstore.encrypted/shadow AND record faithful uid/gid/mode into root.cfs.
-      # -E preserves DEPLOY_ID/SB_KEY/SB_CERT so the -e passthroughs carry values.
-      # fs-verity is NOT enabled here (the digest is computed offline); the target
-      # re-enables verity on landing.
+      # 4. Render composefs, pin its digest, build + sign the UKI.
       - name: Render composefs + build/sign UKI
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
-          # Secure Boot signing key/cert (PEM). Optional during bring-up: if
-          # unset, the UKI is left UNSIGNED and a loud warning is printed.
           SB_KEY: ${{ secrets.SB_KEY }}
           SB_CERT: ${{ secrets.SB_CERT }}
-        run: |
-          set -e
-          mkdir -p out
-          sudo -E podman run --rm \
-            -v "$PWD/rootfs:/rootfs:ro" \
-            -v "$PWD/out:/out" \
-            -e DEPLOY_ID -e SB_KEY -e SB_CERT \
-            docker.io/archlinux:base bash -euo pipefail -c '
-              pacman -Sy --noconfirm composefs fsverity-utils systemd-ukify sbsigntools >/dev/null
+        run: scripts/ci/render-uki.sh
 
-              # 4a. Render the read-only image + content-addressed object store.
-              mkdir -p /out/objects
-              mkcomposefs --digest-store=/out/objects /rootfs /out/root.cfs
-
-              # 4b. Compute the image fs-verity digest (offline; no kernel verity).
-              #     Format is "sha256:<hex> <file>"; keep the bare hex.
-              DIGEST=$(fsverity digest /out/root.cfs | awk "{print \$1}" | sed "s/^sha256://")
-              [ -n "$DIGEST" ] || { echo "FATAL: empty composefs digest" >&2; exit 1; }
-              echo "$DIGEST" > /out/composefs.digest
-              echo "composefs.digest=$DIGEST"
-
-              # 4c. Build the UKI with the digest baked into the signed cmdline.
-              KVER=$(ls /rootfs/usr/lib/modules | grep -v "^extramodules" | head -n1)
-              ukify build \
-                --linux="/rootfs/usr/lib/modules/$KVER/vmlinuz" \
-                --initrd="/rootfs/usr/lib/zerith/initramfs.img" \
-                --cmdline "deploy=$DEPLOY_ID composefs.digest=$DIGEST" \
-                --stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub \
-                --output=/out/zerith.efi
-
-              # 4d. Stage Limine for the same chain (firmware -> Limine -> UKI),
-              #     and Secure Boot sign both (gated on a key being provided).
-              [ -f /rootfs/usr/share/limine/BOOTX64.EFI ] \
-                || { echo "FATAL: Limine BOOTX64.EFI not in rootfs" >&2; exit 1; }
-              cp /rootfs/usr/share/limine/BOOTX64.EFI /out/BOOTX64.EFI
-
-              if [ -n "$SB_KEY" ] && [ -n "$SB_CERT" ]; then
-                printf "%s" "$SB_KEY"  > /tmp/sb.key
-                printf "%s" "$SB_CERT" > /tmp/sb.crt
-                for img in /out/zerith.efi /out/BOOTX64.EFI; do
-                  sbsign --key /tmp/sb.key --cert /tmp/sb.crt \
-                         --output "$img" "$img"
-                  sbverify --cert /tmp/sb.crt "$img"
-                done
-                rm -f /tmp/sb.key /tmp/sb.crt
-                echo "UKI + Limine signed for Secure Boot"
-              else
-                echo "::warning::SB_KEY/SB_CERT not set — UKI and Limine are UNSIGNED. Secure Boot will reject them."
-              fi
-            '
-          # /out is root-owned (rendered as root); hand it back to the runner so
-          # the later unprivileged push/sign steps can read it.
-          sudo chown -R "$(id -u):$(id -g)" out
-
-      # ---- 5. Tooling for push + sign -----------------------------------------
+      # 5. Tooling for push + sign.
       # TODO: pin these to commit SHAs to match the rest of the workflow.
       - name: Install oras
         uses: oras-project/setup-oras@v2
@@ -221,101 +121,22 @@ jobs:
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "${{ github.token }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # ---- 6. Write per-deployment metadata (+ pack objects into ONE blob) ----
-      # Concatenates every composefs object (sorted by digest) into a single
-      # pack blob and writes an index mapping each object's digest -> its
-      # [offset, length] in the pack. Clients fetch the small index once, work
-      # out which objects they lack (from root.cfs), and pull ONLY those byte
-      # ranges off the pack via HTTP Range requests. One big blob on the
-      # registry; surgical, few-request downloads off it.
+      # 6. Write per-deployment metadata + pack objects into one blob.
       - name: Write deployment.json + pack objects
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
           VERSION: ${{ steps.meta.outputs.version }}
           DEPLOYED_AT: ${{ steps.meta.outputs.date }}
-        run: |
-          set -e
-          OBJ_REF="${IMAGE_REGISTRY}/${IMAGE_NAME}-objects:${DEPLOY_ID}"
-          DIGEST=$(cat out/composefs.digest)
+        run: scripts/ci/pack-objects.sh
 
-          # Sorting by relpath ("ab/cdef") is identical to sorting by digest
-          # (the '/' sits at a fixed position), so the pack order is stable: an
-          # unchanged set of objects yields a byte-identical pack -> identical
-          # blob digest -> the registry dedups the whole push. Build it with a
-          # single xargs|cat (no per-object process spawn) and compute offsets
-          # in one awk pass over the same sorted list, so index and pack agree.
-          ( cd out/objects
-            find . -type f -printf '%P\t%s\n' | LC_ALL=C sort > /tmp/objs
-            cut -f1 /tmp/objs | tr '\n' '\0' | xargs -0 cat > ../objects.pack
-            awk -F'\t' 'BEGIN{off=0} { d=$1; sub("/","",d); print d, off, $2; off += $2 }' \
-              /tmp/objs > ../objects.index )
-          gzip -9 -f out/objects.index            # -> out/objects.index.gz
-
-          PACK_DIGEST="sha256:$(sha256sum out/objects.pack | awk '{print $1}')"
-          PACK_SIZE=$(stat -c %s out/objects.pack)
-          IDX_DIGEST="sha256:$(sha256sum out/objects.index.gz | awk '{print $1}')"
-          IDX_SIZE=$(stat -c %s out/objects.index.gz)
-          echo "pack: $(wc -l < /tmp/objs) objects, ${PACK_SIZE} bytes (${PACK_DIGEST})"
-
-          # deployment.json records the pack + index blob digests so the client
-          # can address them directly. The deployment artifact is cosign-signed,
-          # so these digests are anchored; objects also self-verify (fs-verity
-          # name == content), so a tampered pack or index can't land.
-          jq -n \
-            --arg deploy_id "$DEPLOY_ID" \
-            --arg version "$VERSION" \
-            --arg digest "$DIGEST" \
-            --arg objects_ref "$OBJ_REF" \
-            --arg deployed_at "$DEPLOYED_AT" \
-            --arg pack_digest "$PACK_DIGEST" --argjson pack_size "$PACK_SIZE" \
-            --arg idx_digest "$IDX_DIGEST" --argjson idx_size "$IDX_SIZE" \
-            '{schema:2, deploy_id:$deploy_id, version:$version,
-              composefs_digest:$digest, objects_ref:$objects_ref,
-              objects_pack:{digest:$pack_digest, size:$pack_size},
-              objects_index:{digest:$idx_digest, size:$idx_size, encoding:"gzip"},
-              deployed_at:$deployed_at}' \
-            > out/deployment.json
-
-          {
-            echo "OBJ_REF=${OBJ_REF}"
-            echo "DEPLOY_REF_ID=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEPLOY_ID}"
-            echo "DEPLOY_REF_CHANNEL=${IMAGE_REGISTRY}/${IMAGE_NAME}:${TAG_PREFIX}${DEFAULT_TAG}"
-          } >> "$GITHUB_ENV"
-
-      # ---- 7. Push the OCI artifacts via oras ---------------------------------
-      # Deployment artifact = UKI + root.cfs + deployment.json (unique per build,
-      # cosign-signed). Objects artifact = the pack blob + the gzip index: two
-      # blobs total, so the push is one streamed upload (not thousands of tiny
-      # round-trips). An unchanged pack dedups at the registry by digest.
+      # 7. Push the OCI artifacts via oras.
       - name: Push deployment + objects
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        run: |
-          set -e
+        run: scripts/ci/push-artifacts.sh
 
-          ( cd out && oras push "$DEPLOY_REF_ID" \
-              --artifact-type application/vnd.zerith.deployment+json \
-              deployment.json:application/vnd.zerith.deployment.config+json \
-              zerith.efi:application/vnd.zerith.uki \
-              BOOTX64.EFI:application/vnd.zerith.bootloader \
-              root.cfs:application/vnd.zerith.composefs.image+erofs )
-          # Move the channel tag to this build.
-          oras tag "$DEPLOY_REF_ID" "${TAG_PREFIX}${DEFAULT_TAG}"
-
-          ( cd out && oras push "$OBJ_REF" \
-              --artifact-type application/vnd.zerith.objects \
-              objects.pack:application/vnd.zerith.objects.pack \
-              objects.index.gz:application/vnd.zerith.objects.index+gzip )
-          echo "pushed objects pack + index"
-
-      # ---- 8. Sign the deployment artifact (keyless, OIDC) --------------------
-      # Only the deployment artifact is signed/verified: object integrity is
-      # already anchored by it (signed UKI -> composefs.digest -> verified
-      # root.cfs -> per-object fs-verity recorded inside it), so a tampered or
-      # swapped object can't satisfy the mount. The client verifies this ref.
+      # 8. Sign the deployment artifact (keyless, OIDC).
       - name: Cosign sign
         if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           COSIGN_YES: "true"
-        run: |
-          set -e
-          cosign sign "$DEPLOY_REF_ID"
+        run: scripts/ci/cosign-sign.sh
