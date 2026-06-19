@@ -146,7 +146,7 @@ jobs:
         run: |
           set -e
           mkdir -p out
-          podman run --rm \
+          sudo podman run --rm \
             -v "$PWD/rootfs:/rootfs:ro" \
             -v "$PWD/out:/out" \
             -e DEPLOY_ID -e SB_KEY -e SB_CERT \
@@ -181,6 +181,7 @@ jobs:
                 echo "::warning::SB_KEY/SB_CERT not set — UKI is UNSIGNED. Secure Boot will reject it."
               fi
             '
+          sudo chown -R "$(id -u):$(id -g)" out
 
       - name: Install oras
         uses: oras-project/setup-oras@v1

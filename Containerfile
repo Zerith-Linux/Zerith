@@ -98,6 +98,7 @@ RUN pacman -Syu --noconfirm \
     efibootmgr \
     limine \
     podman \
+    cosign \
     kmod \
     pciutils \
     usbutils \
@@ -119,10 +120,20 @@ RUN pacman -Syu --noconfirm \
     btop \
     awww
 
+RUN set -eux; \
+    VERSION="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+      https://github.com/oras-project/oras/releases/latest | \
+      sed 's#.*/tag/v##')"; \
+    curl -fsSLo "oras.tar.gz" \
+      "https://github.com/oras-project/oras/releases/download/v${VERSION}/oras_${VERSION}_linux_amd64.tar.gz"; \
+    tar -xzf oras.tar.gz; \
+    install -Dm755 oras /usr/local/bin/oras; \
+    rm -f oras.tar.gz oras
+
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     su aur -c "cd /home/aur && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm" && \
-    su aur -c "yay -S --noconfirm mangowm vibepanel-bin veila-bin cosign oras-bin" && \
+    su aur -c "yay -S --noconfirm mangowm vibepanel-bin veila-bin" && \
     pacman -Rs --noconfirm base-devel && \
     pacman -Scc --noconfirm && \
     userdel -r aur && \
