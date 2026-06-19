@@ -9,7 +9,7 @@ differ at every layer of the stack.
 
 | | Zerith | bootc |
 |---|---|---|
-| Loader | **Limine** v12.3.3 — pinned, sha256-verified in CI, Secure Boot-signed alongside the UKI | **GRUB+shim** (default) or **systemd-boot** (composefs backend, sealed-image mode) |
+| Loader | **Limine** — pinned, sha256-verified in CI, Secure Boot-signed alongside the UKI | **GRUB+shim** (default) or **systemd-boot** (composefs backend, sealed-image mode) |
 | Sourcing | Fetched from upstream release as part of the CI pipeline; ships only in the signed deployment artifact | Installed from the OS image's package manager; updated as part of the image |
 | Attack surface | Minimal two-stage bootloader (~50 KB signed binary, flat config with no scripting) | GRUB is a full boot environment with scripting, modules, filesystem drivers, network stack |
 | Shim chain | None — your signing key is enrolled directly in UEFI | Microsoft-signed shim validates GRUB, which validates the UKI or kernel; works on locked-down firmware without key enrollment |

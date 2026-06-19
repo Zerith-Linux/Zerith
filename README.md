@@ -6,6 +6,9 @@ factory-reset model.
 
 **No Bootc here ;P** — but Zerith is definitely inspired by bootc.
 
+[Comparison to Bootc](docs/comparison-to-bootc.md)
+
+
 ---
 
 ## What is Zerith?
