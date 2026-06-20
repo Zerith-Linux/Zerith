@@ -19,6 +19,7 @@ import gzip
 import os
 import re
 import shutil
+import sys
 import tarfile
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -288,18 +289,25 @@ def _coalesce_ranges(want: list[tuple[int, int, str]],
 
 def _fetch_range(registry: str, repo_path: str, blob_digest: str,
                  start: int, end: int, out_path: Path,
-                 auth: str | None) -> Path:
+                 auth: str | None, show_progress: bool = False) -> Path:
     """GET one byte range of the pack blob to ``out_path``. Safe in a worker
     thread (touches only its own file + shells out to curl). ``curl -L`` follows
     the registry's redirect to backing storage, carrying the Range.
+
+    When ``show_progress`` is set, curl draws its own progress bar on stderr
+    (used for the single-range case, e.g. a fresh install pulling the whole
+    pack); otherwise it runs silently and its output is captured for error
+    reporting.
     """
     url = f"https://{registry}/v2/{repo_path}/blobs/{blob_digest}"
-    cmd = ["curl", "-fsSL", "--retry", "3", "--retry-delay", "1",
+    cmd = ["curl", "-fL", "--retry", "3", "--retry-delay", "1",
            "-H", f"Range: bytes={start}-{end}"]
+    cmd += ["--progress-bar"] if show_progress else ["-sS"]
     if auth:
         cmd += ["-H", auth]
     cmd += ["-o", str(out_path), url]
-    run(cmd, capture=True)
+    # Don't capture when showing the bar, so curl's meter reaches the terminal.
+    run(cmd, capture=not show_progress)
     got, wanted = out_path.stat().st_size, end - start + 1
     if got != wanted:
         die(f"range fetch returned {got} bytes, expected {wanted} "
@@ -407,13 +415,16 @@ def _land_pack_by_range(repo: str, pack_digest: str,
     try:
         new = 0
         jobs = max(1, min(config.FETCH_JOBS, len(ranges)))
+        # One range (e.g. a fresh whole-pack pull) has nothing for the per-range
+        # bar to tick through, so let curl show its own byte-level meter instead.
+        show_progress = len(ranges) == 1 and sys.stderr.isatty()
         prog = Progress(len(ranges), label="objects")
         with ThreadPoolExecutor(max_workers=jobs) as pool:
             futures = {}
             for i, (start, end, objs) in enumerate(ranges):
                 fut = pool.submit(_fetch_range, registry, repo_path,
                                   pack_digest, start, end, staging / f"r{i}",
-                                  auth)
+                                  auth, show_progress)
                 futures[fut] = (start, end, objs)
             for fut in as_completed(futures):
                 buf_path = fut.result()         # re-raises fetch failure
