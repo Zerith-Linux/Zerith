@@ -1,0 +1,26 @@
+name: Test Zerith
+
+on:
+  pull_request:
+    branches: ['*']
+
+  schedule:
+    - cron: '05 10 * * *' # 10:05 UTC daily
+
+  push:
+    branches: ['*']
+    paths-ignore:
+      - '**/README.md'
+      - 'docs/**'
+      - 'releases.json'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install pytest
+      - run: python3 -m pytest tests/
