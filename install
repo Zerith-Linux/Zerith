@@ -19,7 +19,7 @@ set -euo pipefail
 ZERITH_REF="${ZERITH_REF:-ghcr.io/zerith-linux/zerith:latest}"
 ZERITH_REPO="${ZERITH_REPO:-https://github.com/Zerith-Linux/Zerith}"
 ZERITH_BRANCH="${ZERITH_BRANCH:-main}"
-ZERITH_COSIGN_IDENTITY="${ZERITH_COSIGN_IDENTITY:-https://github.com/Zerith-Linux/Zerith/\.github/workflows/build\.yml@refs/heads/.+}"
+export ZERITH_COSIGN_IDENTITY="${ZERITH_COSIGN_IDENTITY:-https://github.com/Zerith-Linux/Zerith/\.github/workflows/build\.yml@refs/heads/.+}"
 ZERITH_DISK="${ZERITH_DISK:-}"
 ZERITH_INSECURE="${ZERITH_INSECURE:-}"   # set to skip cosign verification (dev)
 ZERITH_YES="${ZERITH_YES:-}"             # set to skip the wipe confirmation
