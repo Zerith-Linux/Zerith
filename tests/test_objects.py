@@ -73,9 +73,10 @@ def test_missing_objects_splits_present_inlined_missing(tmp_path, monkeypatch):
     index = {missing: (100, 40)}              # inlined absent from index
     src = SimpleNamespace(root_cfs=tmp_path / "root.cfs")
 
-    want, n_inlined = objects._missing_objects(src, shared, index)
+    want, n_inlined, n_present = objects._missing_objects(src, shared, index)
     assert want == [(100, 40, missing)]
     assert n_inlined == 1
+    assert n_present == 1
 
 
 def test_sweep_orphans_by_link_count(tmp_path):

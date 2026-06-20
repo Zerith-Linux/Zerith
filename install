@@ -41,6 +41,39 @@ ensure_root() {
 }
 
 # --- 2. Ensure the required tools are present --------------------------------
+# oras isn't in the Arch repos, so it's fetched from GitHub releases. Pin the
+# version here; the asset arch is derived from `uname -m`.
+ORAS_VERSION="${ORAS_VERSION:-1.3.2}"
+
+# Map `uname -m` to the arch slug oras uses in its release asset names.
+oras_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)   echo amd64 ;;
+        aarch64|arm64)  echo arm64 ;;
+        armv7l)         echo arm ;;
+        *) die "unsupported architecture '$(uname -m)' for oras download" ;;
+    esac
+}
+
+# Download and install a static `oras` into /usr/local/bin. All work happens in
+# a private temp dir (curl | bash leaves CWD unknown / possibly unwritable), and
+# the dir is removed on any exit.
+install_oras() {
+    local arch tmp tarball
+    arch="$(oras_arch)"
+    tmp="$(mktemp -d /tmp/zerith-oras.XXXXXX)" || die "mktemp failed"
+    # shellcheck disable=SC2064  # expand $tmp now, not at trap time
+    trap "rm -rf '$tmp'" RETURN
+    tarball="oras_${ORAS_VERSION}_linux_${arch}.tar.gz"
+
+    say "installing oras ${ORAS_VERSION} (${arch})"
+    curl -fsSL -o "$tmp/$tarball" \
+        "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${tarball}" \
+        || die "failed to download $tarball"
+    tar -zxf "$tmp/$tarball" -C "$tmp" oras || die "failed to extract oras"
+    install -m 0755 "$tmp/oras" /usr/local/bin/oras || die "failed to install oras"
+}
+
 ensure_tools() {
     local missing=()
     local tool
@@ -50,23 +83,43 @@ ensure_tools() {
     [ "${#missing[@]}" -eq 0 ] && return 0
 
     say "missing tools: ${missing[*]}"
-    if command -v pacman >/dev/null 2>&1; then
-        say "installing them with pacman"
-        # Map tool names to the Arch packages that provide them.
-        pacman -Sy --noconfirm --needed \
-            python btrfs-progs dosfstools gptfdisk util-linux composefs \
-            fsverity-utils curl cosign || \
-            warn "pacman could not install everything; continuing anyway"
-    else
-        warn "no pacman here — install these yourself before continuing: ${missing[*]}"
+
+    # Everything except oras comes from the distro. oras is handled separately
+    # because it isn't packaged in the Arch repos.
+    local need_pkg=()
+    for tool in "${missing[@]}"; do
+        [ "$tool" = "oras" ] || need_pkg+=("$tool")
+    done
+
+    if [ "${#need_pkg[@]}" -gt 0 ]; then
+        if command -v pacman >/dev/null 2>&1; then
+            say "installing distro tools with pacman"
+            # Map tool names to the Arch packages that provide them.
+            pacman -Sy --noconfirm --needed \
+                python btrfs-progs dosfstools gptfdisk util-linux composefs \
+                fsverity-utils curl cosign || \
+                warn "pacman could not install everything; continuing anyway"
+        else
+            warn "no pacman here — install these yourself: ${need_pkg[*]}"
+        fi
     fi
 
-    VERSION="1.3.2"
-    curl -LO "https://github.com/oras-project/oras/releases/download/v${VERSION}/oras_${VERSION}_linux_amd64.tar.gz"
-    mkdir -p oras-install/
-    tar -zxf oras_${VERSION}_*.tar.gz -C oras-install/
-    mv oras-install/oras /usr/local/bin/
-    rm -rf oras_${VERSION}_*.tar.gz oras-install/
+    # Fetch oras only if it's actually one of the missing tools.
+    for tool in "${missing[@]}"; do
+        if [ "$tool" = "oras" ]; then
+            install_oras
+            break
+        fi
+    done
+
+    # Re-check so we fail here with a clear list rather than deep inside the
+    # installer with a cryptic "command not found".
+    local still=()
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || still+=("$tool")
+    done
+    [ "${#still[@]}" -eq 0 ] || \
+        die "still missing after setup: ${still[*]} — install them and re-run"
 }
 
 # --- 3. Locate or fetch the zerithctl package --------------------------------
@@ -127,6 +180,21 @@ choose_disk() {
     done
 }
 
+# --- 4b. Confirm the wipe ----------------------------------------------------
+# Ask before erasing the disk. Reads the answer from /dev/tty so it works under
+# `curl | bash` (where stdin is the script, not the keyboard). Skipped when
+# ZERITH_YES is set. On confirmation main passes --yes to zerithctl so it
+# doesn't prompt again on a stdin it can't read.
+confirm_wipe() {
+    local disk="$1" resp
+    [ -n "$ZERITH_YES" ] && return 0
+    [ -r /dev/tty ] || die "no terminal to confirm on; set ZERITH_YES=1 to proceed"
+    say "WARNING: this will ERASE ALL DATA on $disk."
+    printf "install-zerith: type 'yes' to continue: " >/dev/tty
+    read -r resp </dev/tty || die "aborted"
+    [ "$(printf '%s' "$resp" | tr '[:upper:]' '[:lower:]')" = "yes" ] || die "aborted"
+}
+
 # --- 5. Hand off to zerithctl install ----------------------------------------
 main() {
     ensure_root "$@"
@@ -138,7 +206,6 @@ main() {
 
     local args=(install --ref "$ZERITH_REF")
     [ -n "$ZERITH_INSECURE" ] && args+=(--insecure-skip-verify)
-    [ -n "$ZERITH_YES" ] && args+=(--yes)
 
     # Two modes: existing mountpoints (sysroot + efi), or a whole disk.
     if [ "$#" -eq 2 ]; then
@@ -146,8 +213,11 @@ main() {
         args+=("$1" "$2")
     else
         choose_disk
+        confirm_wipe "$TARGET_DISK"
         say "installing onto $TARGET_DISK"
-        args+=(--disk "$TARGET_DISK")
+        # Confirmation already happened here, so tell zerithctl to skip its own
+        # prompt (it can't read a pipe-fed stdin under `curl | bash`).
+        args+=(--disk "$TARGET_DISK" --yes)
     fi
 
     exec python3 "$tool_dir/zerithctl" "${args[@]}"
