@@ -4,9 +4,6 @@ on:
   pull_request:
     branches: ['*']
 
-  schedule:
-    - cron: '05 10 * * *' # 10:05 UTC daily
-
   push:
     branches: ['*']
     paths-ignore:
