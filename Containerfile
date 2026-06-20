@@ -122,6 +122,7 @@ RUN pacman -Syu --noconfirm \
     nvim \
     emacs \
     btop \
+    kitty \
     awww
 
 RUN set -eux; \

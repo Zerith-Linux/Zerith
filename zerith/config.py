@@ -53,7 +53,7 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
 
 # Parallel object-shard fetches. Each fetch is an independent network round
 # trip, so a small pool keeps the link busy between blobs. See docs/objects.md.
-FETCH_JOBS = _env_int("ZERITH_FETCH_JOBS", 8, minimum=1)
+FETCH_JOBS = _env_int("ZERITH_FETCH_JOBS", 4, minimum=1)
 
 # Max gap (bytes of already-present data) to fold into a single HTTP Range
 # request when fetching from the pack blob. 0 disables coalescing.
