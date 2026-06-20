@@ -144,7 +144,7 @@ RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     su aur -c "cd /home/aur && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm" && \
     su aur -c "yay -S --noconfirm mangowm vibepanel-bin veila-bin" && \
-    pacman -Rs --noconfirm base-devel && \
+    pacman -Rs --noconfirm base-devel yay && \
     pacman -Scc --noconfirm && \
     userdel -r aur && \
     sed -i '/aur ALL=(ALL) NOPASSWD: ALL/d' /etc/sudoers
