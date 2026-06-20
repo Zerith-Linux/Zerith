@@ -18,6 +18,7 @@ from typing import Generator
 
 from . import config, layout, objects, runtime
 from .oci import Source
+from .progress import StatusLine
 from .runtime import die, log, vlog
 from .verity import enable_verity, measure_file
 
@@ -62,14 +63,20 @@ def materialize(deploy: Path, src: Source, *, old_shards: dict) -> None:
     else:
         ddir.mkdir(parents=True, exist_ok=True)
 
+    status = StatusLine()
+
     _land_objects(deploy, src, shared, old_shards=old_shards)
+
+    status.show("verifying root.cfs...")
     _place_root_cfs(src, root_cfs)
 
     if runtime.DRY_RUN:
         log(f"[dry-run] hardlink referenced objects into {holder}")
     else:
+        status.show("linking objects...")
         objects.link_holder(shared, holder, root_cfs)
 
+    status.show("copying boot files...")
     if runtime.DRY_RUN:
         log(f"[dry-run] cp {src.uki} -> {deploy_uki}")
         log(f"[dry-run] cp {src.bootloader} -> {ddir /
@@ -79,6 +86,7 @@ def materialize(deploy: Path, src: Source, *, old_shards: dict) -> None:
         if src.bootloader.is_file():
             shutil.copy2(src.bootloader, ddir / config.BOOTLOADER_NAME)
 
+    status.done(f"deployment {src.deploy_id} materialized")
     layout.write_meta(ddir, src)
 
 

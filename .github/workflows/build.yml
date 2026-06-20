@@ -2,18 +2,10 @@
 name: Build container image
 
 on:
-  pull_request:
-    branches: ['*']
+  workflow_run:
+    workflows: ["test"]
+    types: [completed]
 
-  schedule:
-    - cron: '05 10 * * *' # 10:05 UTC daily
-
-  push:
-    branches: ['*']
-    paths-ignore:
-      - '**/README.md'
-      - 'docs/**'
-      - 'releases.json'
 
   workflow_dispatch:
 

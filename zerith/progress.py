@@ -37,18 +37,18 @@ class Progress:
         self.start = time.monotonic()
         self.tty = sys.stderr.isatty()
 
-    def update(self, nbytes: int) -> None:
+    def update(self, nbytes: int = 0) -> None:
         self.done += 1
         self.nbytes += nbytes
         if not self.tty:
             return
         filled = int(self._BAR_WIDTH * self.done / self.total)
         bar = "█" * filled + "░" * (self._BAR_WIDTH - filled)
-        rate = self.nbytes / self.elapsed
-        sys.stderr.write(
-            f"\r\033[Kzerithctl: {self.label} [{bar}] "
-            f"{self.done}/{self.total}  {human_bytes(self.nbytes)}  "
-            f"{human_bytes(rate)}/s")
+        line = f"\r\033[Kzerithctl: {self.label} [{bar}] {self.done}/{self.total}"
+        if self.nbytes:
+            rate = self.nbytes / self.elapsed
+            line += f"  {human_bytes(self.nbytes)}  {human_bytes(rate)}/s"
+        sys.stderr.write(line)
         sys.stderr.flush()
 
     @property
@@ -58,5 +58,28 @@ class Progress:
     def finish(self, msg: str) -> None:
         if self.tty:
             sys.stderr.write("\r\033[K")        # wipe the bar line first
+            sys.stderr.flush()
+        log(msg)
+
+
+class StatusLine:
+    """A single-line status indicator that rewrites itself on a TTY while a
+    non-quantified phase (e.g.  verifying, linking) runs.  On a non-TTY every
+    call to :meth:`show` is a silent no-op so only the final :meth:`done`
+    summary pollutes CI logs."""
+
+    def __init__(self) -> None:
+        self.tty = sys.stderr.isatty()
+
+    def show(self, msg: str) -> None:
+        """Show a status message, overwriting the previous line."""
+        if self.tty:
+            sys.stderr.write(f"\r\033[Kzerithctl: {msg}")
+            sys.stderr.flush()
+
+    def done(self, msg: str) -> None:
+        """Clear the status line and write a permanent log message."""
+        if self.tty:
+            sys.stderr.write("\r\033[K")
             sys.stderr.flush()
         log(msg)

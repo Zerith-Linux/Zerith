@@ -74,8 +74,10 @@ def link_holder(shared: Path, holder: Path, root_cfs: Path) -> None:
     """
     require_tool("composefs-info")
     holder.mkdir(parents=True, exist_ok=True)
+    refs = referenced_objects(root_cfs)
     linked = 0
-    for rel in referenced_objects(root_cfs):
+    prog = Progress(len(refs), label="linking")
+    for rel in refs:
         src = shared / rel
         if not src.is_file():
             continue
@@ -86,7 +88,8 @@ def link_holder(shared: Path, holder: Path, root_cfs: Path) -> None:
             linked += 1
         except FileExistsError:
             pass
-    vlog(f"holder: linked {linked} object(s) for this deployment")
+        prog.update()
+    prog.finish(f"holder: linked {linked} object(s) for this deployment")
 
 
 # --------------------------------------------------------------------------- #
