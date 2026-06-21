@@ -115,18 +115,18 @@ jobs:
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
           echo "${{ github.token }}" | cosign login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # 6. Write per-deployment metadata + pack objects into one blob.
-      - name: Write deployment.json + pack objects
+      # 6. Write per-deployment metadata + pack objects into one slab.
+      - name: Write deployment.json + pack slab
         env:
           DEPLOY_ID: ${{ steps.deploy_id.outputs.id }}
           VERSION: ${{ steps.meta.outputs.version }}
           DEPLOYED_AT: ${{ steps.meta.outputs.date }}
-        run: scripts/ci/pack-objects.sh
+        run: scripts/ci/pack-slab.sh
 
-      # 7. Gate: verify the pack + index reconstruct every object byte-for-byte
+      # 7. Gate: verify the slab + index reconstruct every object byte-for-byte
       #    before anything is pushed. Runs on every build, including PRs.
-      - name: Verify pack integrity
-        run: python3 scripts/ci/verify-pack.py
+      - name: Verify slab integrity
+        run: python3 scripts/ci/verify-slab.py
 
       # 8. Push the OCI artifacts via oras.
       - name: Push deployment + objects

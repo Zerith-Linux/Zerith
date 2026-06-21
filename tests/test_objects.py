@@ -18,17 +18,6 @@ def test_digest_regex_finds_all():
     assert objects._DIGEST_RE.findall(text) == [a, b]
 
 
-@pytest.mark.parametrize("rel,ok", [
-    ("ab/" + "c" * 62, True),
-    ("ab/cd", True),
-    ("a/" + "b" * 62, False),       # one-char prefix
-    ("../etc/passwd", False),       # traversal
-    ("abc/" + "d" * 60, False),     # three-char prefix
-])
-def test_obj_path_regex(rel, ok):
-    assert bool(objects._OBJ_PATH_RE.match(rel)) is ok
-
-
 def test_parse_index():
     text = "aaaa 0 10\nbbbb 10 25\ncccc 35 5\n"
     assert objects._parse_index(text) == {

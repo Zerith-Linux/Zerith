@@ -43,10 +43,10 @@ script in `scripts/ci/` (see [ci-workflows.md](ci-workflows.md)):
    the pinned Limine loader (`limine-binary.zip` v12.3.3, sha256-verified) is
    fetched, and `sbsign` signs both the UKI and the Limine loader for Secure
    Boot in the same step.
-5. **Pack objects + write metadata** — concatenate the objects into one pack
+5. **Pack objects + write metadata** — concatenate the objects into one slab
    blob with a digest→offset index, and write `deployment.json`
    ([objects.md](objects.md)).
-6. **Verify pack integrity** — confirm the pack + index reconstruct every
+6. **Verify slab integrity** — confirm the slab + index reconstruct every
    object byte-for-byte before anything is pushed (runs on every build,
    including PRs).
 7. **Push** the deployment and objects artifacts via `oras`.

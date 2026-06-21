@@ -13,23 +13,20 @@ stored once and shared across every deployment.
 
 ## Landing strategies
 
-`zerith/objects.py` funnels three sources through one `place_object` step
+`zerith/objects.py` funnels two sources through one `place_object` step
 (verify the fs-verity digest matches the store path, move into place, seal with
 fs-verity):
 
 - **Local directory** (`land_from_dir`) — copy from a CI output `objects/` tree,
   for offline `--local` installs.
-- **Pack blob** (`land_from_pack`) — the schema-2 default (see below).
-- **Legacy shards** (`land_from_ref`) — per-prefix tarballs, diffed by digest
-  against the current deployment so only changed buckets are fetched. Kept for
-  older artifacts.
+- **Object slab** (`land_from_slab`) — the network default (see below).
 
-## The pack blob and index (schema 2)
+## The object slab and index
 
-CI concatenates every object (sorted by digest) into one **pack blob** and
+CI concatenates every object (sorted by digest) into one **slab blob** and
 writes an **index** mapping each object's digest to its `[offset, length]` in
-the pack. Both are pushed as ordinary OCI blobs. Sorting by store path equals
-sorting by digest, so an unchanged set of objects produces a byte-identical pack
+the slab. Both are pushed as ordinary OCI blobs. Sorting by store path equals
+sorting by digest, so an unchanged set of objects produces a byte-identical slab
 — identical blob digest — and the registry deduplicates the whole push.
 
 The host fetches the small index once (whole, via `oras`), computes which
@@ -38,12 +35,12 @@ ranges covering those objects** with HTTP Range requests, coalescing objects
 that sit within `ZERITH_COALESCE_GAP` bytes of each other into one request.
 
 A single path serves both first install and incremental update: on a fresh
-install every object is missing, and because the pack is laid out contiguously
+install every object is missing, and because the slab is laid out contiguously
 the coalescer collapses the whole want-list into one Range spanning the entire
-pack — i.e. a single whole-pack download. An update fetches only the handful of
+slab — i.e. a single whole-slab download. An update fetches only the handful of
 ranges its changed objects touch. This was validated against the live GHCR
 registry (Range returns `206` with exact byte counts; fetched bytes verify
-against their fs-verity digest), so there is no separate whole-pack code path.
+against their fs-verity digest), so there is no separate whole-slab code path.
 
 > **Requirement:** the registry must honor HTTP Range on blob GETs. GHCR does.
 > If a registry ignored Range and returned a full body for a partial request,
@@ -56,7 +53,7 @@ skipped.
 
 ## Parallelism and progress
 
-Shard and range fetches run in a thread pool (`ZERITH_FETCH_JOBS`, default 8).
+Range fetches run in a thread pool (`ZERITH_FETCH_JOBS`, default 8).
 Each worker shells out to `oras`/`curl`, which releases the GIL while waiting on
 the network, and touches only its own temp file. The terminal progress bar is
 written by the main thread alone, so nothing races on the TTY; on a non-TTY

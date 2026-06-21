@@ -123,18 +123,13 @@ class Source:
         return self.meta.get("objects_ref")
 
     @property
-    def object_shards(self) -> dict:
-        """Legacy layout: prefix -> shard blob digest."""
-        return self.meta.get("object_shards", {}) or {}
-
-    @property
-    def objects_pack(self) -> dict:
-        """schema>=2: ``{digest, size}`` of the single concatenated pack blob."""
-        return self.meta.get("objects_pack") or {}
+    def objects_slab(self) -> dict:
+        """``{digest, size}`` of the single concatenated object slab blob."""
+        return self.meta.get("objects_slab") or {}
 
     @property
     def objects_index(self) -> dict:
-        """schema>=2: ``{digest, size, encoding}`` of the digest->offset index."""
+        """``{digest, size, encoding}`` of the slab's digest->offset index."""
         return self.meta.get("objects_index") or {}
 
     def cleanup(self) -> None:

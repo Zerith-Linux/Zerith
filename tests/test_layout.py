@@ -8,7 +8,7 @@ from zerith import config, layout
 def _fake_source(deploy_id="dep123", **over):
     base = dict(deploy_id=deploy_id, version="20260101", digest="d" * 64,
                 objects_ref="ghcr.io/o/zerith-objects:dep123",
-                object_shards={}, objects_pack={"digest": "sha256:p", "size": 1},
+                objects_slab={"digest": "sha256:s", "size": 1},
                 objects_index={"digest": "sha256:i", "size": 1,
                                "encoding": "gzip"},
                 ref="ghcr.io/o/zerith:latest")
@@ -36,7 +36,7 @@ def test_meta_round_trip(tmp_path):
     assert meta["deploy_id"] == src.deploy_id
     assert meta["composefs_digest"] == src.digest
     assert meta["schema"] == config.META_SCHEMA
-    assert meta["objects_pack"] == src.objects_pack
+    assert meta["objects_slab"] == src.objects_slab
 
 
 def test_load_meta_missing_returns_empty(tmp_path):

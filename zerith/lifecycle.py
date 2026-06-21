@@ -43,7 +43,7 @@ def deploy_lock(deploy: Path) -> Generator[None, None, None]:
         os.close(fd)
 
 
-def materialize(deploy: Path, src: Source, *, old_shards: dict) -> None:
+def materialize(deploy: Path, src: Source) -> None:
     """Build deployment ``src`` on disk under ``@deploy``: land its objects,
     place + verify ``root.cfs``, link the GC holder, copy the UKI and loader,
     and write ``deployment.json``. Callers decide whether an existing deployment
@@ -65,7 +65,7 @@ def materialize(deploy: Path, src: Source, *, old_shards: dict) -> None:
 
     status = StatusLine()
 
-    _land_objects(deploy, src, shared, old_shards=old_shards)
+    _land_objects(deploy, src, shared)
 
     status.show("verifying root.cfs...")
     _place_root_cfs(src, root_cfs)
@@ -90,18 +90,14 @@ def materialize(deploy: Path, src: Source, *, old_shards: dict) -> None:
     layout.write_meta(ddir, src)
 
 
-def _land_objects(deploy: Path, src: Source, shared: Path, *,
-                  old_shards: dict) -> None:
+def _land_objects(deploy: Path, src: Source, shared: Path) -> None:
     """Dispatch to the right object-landing strategy for this source."""
     if src.local_objects is not None:
         objects.land_from_dir(src.local_objects, shared)
-    elif src.objects_pack:
-        objects.land_from_pack(src, shared)
-    elif src.objects_ref:
-        objects.land_from_ref(src.objects_ref, shared, src.object_shards,
-                              old_shards)
+    elif src.objects_slab:
+        objects.land_from_slab(src, shared)
     else:
-        die("no object source (neither local objects/ nor objects_ref)")
+        die("no object source (expected a local objects/ tree or a slab artifact)")
 
 
 def _place_root_cfs(src: Source, root_cfs: Path) -> None:
@@ -121,16 +117,15 @@ def _place_root_cfs(src: Source, root_cfs: Path) -> None:
 def stage(deploy: Path, src: Source) -> None:
     """Materialize a deployment (idempotent) and mark it ``staging``.
 
-    For schema>=2 packs this fetches only the byte ranges for missing objects;
-    for legacy shards it diffs against the current deployment's shard map.
+    The slab path fetches only the byte ranges covering objects this image
+    lacks, computed from its own ``root.cfs`` against the shared store — no diff
+    against the current deployment is needed.
     """
     root_cfs = layout.deploy_dir(deploy, src.deploy_id) / config.CFS_NAME
     if not runtime.DRY_RUN and root_cfs.exists():
         log(f"deployment {src.deploy_id} already on disk, reusing")
     else:
-        cur_id = layout.read_role(deploy, "current")
-        old_shards = layout.load_meta(deploy, cur_id).get("object_shards", {})
-        materialize(deploy, src, old_shards=old_shards)
+        materialize(deploy, src)
     layout.set_role(deploy, "staging", src.deploy_id)
 
 

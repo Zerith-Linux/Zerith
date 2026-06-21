@@ -13,7 +13,7 @@ install                    bash bootstrap — prepares the env, then runs `zerit
 zerithctl                  thin entry point that loads the zerith package
 zerith/                    the host-tooling package (install + lifecycle logic)
 scripts/
-  ci/                      CI step scripts (bash per step; verify-pack.py is Python)
+  ci/                      CI step scripts (bash per step; verify-slab.py is Python)
   lib/                     shared shell helpers for the CI scripts
 .github/workflows/build.yml  CI orchestration (calls scripts/ci/*)
 system_files/              files copied verbatim into the image
@@ -34,7 +34,7 @@ orchestration:
 | `verity.py`      | fs-verity measure / enable. |
 | `progress.py`    | Human-readable sizes and the single-writer download bar. |
 | `oci.py`         | OCI ref parsing, cosign verification, registry auth, the `Source` wrapper. |
-| `objects.py`     | The content-addressed object store: landing (dir / shards / pack+range), holders, GC sweep. |
+| `objects.py`     | The content-addressed object store: landing (dir / slab range), holders, GC sweep. |
 | `layout.py`      | On-disk layout primitives: roles, metadata, `source.conf`, ESP paths, atomic copy. |
 | `lifecycle.py`   | `materialize`, stage, promote, rollback, gc, status — operations on an installed host. |
 | `disk.py`        | Whole-disk partition / format / mount for fresh installs. |

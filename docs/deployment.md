@@ -70,7 +70,6 @@ can also run it on demand.
 ## Updates over the wire
 
 `update` pulls the channel recorded in `source.conf`; if its deploy id already
-matches `current`, it is a no-op. Otherwise it stages and promotes. For schema-2
-packs this transfers only the byte ranges for objects the host lacks; for legacy
-shard artifacts it fetches only the buckets whose digest changed. A small OS
-change therefore pulls only the bytes it touched.
+matches `current`, it is a no-op. Otherwise it stages and promotes. It transfers
+only the byte ranges of the slab covering objects the host lacks, so a small OS
+change pulls only the bytes it touched.

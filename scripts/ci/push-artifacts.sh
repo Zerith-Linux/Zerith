@@ -2,10 +2,10 @@
 #
 # Push the two OCI artifacts via oras:
 #   * deployment = UKI + root.cfs + BOOTX64.EFI + deployment.json (cosign-signed)
-#   * objects    = the pack blob + the gzip index (two blobs total)
-# An unchanged pack dedups at the registry by digest. See docs/build-process.md.
+#   * objects    = the slab blob + the gzip index (two blobs total)
+# An unchanged slab dedups at the registry by digest. See docs/build-process.md.
 #
-# Requires: DEPLOY_REF_ID, OBJ_REF, TAG_PREFIX, DEFAULT_TAG (set by pack-objects).
+# Requires: DEPLOY_REF_ID, OBJ_REF, TAG_PREFIX, DEFAULT_TAG (set by pack-slab).
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/common.sh
@@ -25,6 +25,6 @@ oras tag "$DEPLOY_REF_ID" "${TAG_PREFIX}${DEFAULT_TAG}"
 
 ( cd out && oras push "$OBJ_REF" \
     --artifact-type application/vnd.zerith.objects \
-    objects.pack:application/vnd.zerith.objects.pack \
+    objects.slab:application/vnd.zerith.objects.slab \
     objects.index.gz:application/vnd.zerith.objects.index+gzip )
 log "pushed deployment + objects artifacts"

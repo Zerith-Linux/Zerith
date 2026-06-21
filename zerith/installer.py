@@ -41,9 +41,9 @@ def install_deploy(sysroot: Path, efi: Path, src: Source) -> None:
     if not runtime.DRY_RUN and ddir.exists():
         die(f"deployment {src.deploy_id} already installed at {ddir}")
 
-    # First install has no prior shard map to diff against; the pack path fetches
-    # everything, which coalesces into a single whole-pack range.
-    lifecycle.materialize(deploy, src, old_shards={})
+    # First install: every object is missing, so the slab range fetch coalesces
+    # the whole want-list into a single whole-slab range.
+    lifecycle.materialize(deploy, src)
 
     esp_uki = layout.esp_uki(efi, "current")
     if runtime.DRY_RUN:
