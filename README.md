@@ -4,9 +4,9 @@ An immutable, image-based Linux OS built on Artix, with a composefs
 read-only root, role-based deployments with an N-1 fallback, and a true
 factory-reset model.
 
-**No Bootc here ;P** — but Zerith is definitely inspired by bootc.
+A systemd-free take on the modern immutable OS.
 
-[Comparison to Bootc](docs/comparison-to-bootc.md)
+[What makes Zerith strong](docs/strengths.md)
 
 
 ---
@@ -29,8 +29,8 @@ under UEFI.
 
 Zerith exists to answer one question: **what does a modern, image-based,
 atomically-updated Linux look like without systemd?** The immutable-OS idea is
-well proven by Fedora Silverblue, bootc, and the Universal Blue family — but
-nearly all of them are built *on* systemd. Zerith fills that gap:
+well proven — and nearly every implementation of it is built *on* systemd.
+Zerith fills that gap:
 
 - **No systemd in the running OS.** Init is **dinit**, on an Artix base. (The
   one place systemd code appears is the *build*: the UKI is assembled with
@@ -45,10 +45,8 @@ nearly all of them are built *on* systemd. Zerith fills that gap:
   afternoon.
 
 It's a **learn-by-building project**: a way to understand how immutable boot,
-composefs, and UKIs fit together by wiring them up from scratch. If you want a
-battle-tested daily driver today, the systemd-based options above are far more
-mature. If you want a systemd-free take on the same ideas, that's the point of
-Zerith.
+composefs, and UKIs fit together by wiring them up from scratch — and a
+systemd-free take on the image-based OS in its own right.
 
 ## Quick start
 
@@ -75,7 +73,7 @@ The deep dives live in [`docs/`](docs/):
 - [Deployment](docs/deployment.md) — installing and the update lifecycle.
 - [Host tooling](docs/host-tooling.md) — `zerithctl` and `install` reference.
 - [Development](docs/development.md) — working on the code and running the tests.
-- [Comparison to bootc](docs/comparison-to-bootc.md) — architectural tradeoffs vs. bootc.
+- [What makes Zerith strong](docs/strengths.md) — the design choices that set Zerith apart.
 
 ## Status
 
