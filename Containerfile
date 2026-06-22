@@ -88,6 +88,8 @@ RUN pacman -Syu --noconfirm \
     networkmanager-dinit \
     shadow \
     sudo \
+    emptty \
+    emptty-dinit \
     curl \
     dhcpcd \
     iproute2 \
@@ -152,7 +154,10 @@ RUN useradd -m -G wheel aur && \
 RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN dinitctl -o enable NetworkManager && \
-    dinitctl -o enable dbus
+    dinitctl -o enable dbus && \
+    dinitctl -o enable emptty
+
+RUN sed -i 's#/dev/tty\[1-6\]#/dev/tty[2-6]#' /etc/dinit.d/config/console.conf
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
