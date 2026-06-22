@@ -157,7 +157,8 @@ RUN dinitctl -o enable NetworkManager && \
     dinitctl -o enable dbus && \
     dinitctl -o enable emptty
 
-RUN sed -i 's#/dev/tty\[1-6\]#/dev/tty[2-6]#' /etc/dinit.d/config/console.conf
+RUN sed -i -E 's#^[[:space:]]*[Cc]ommand[[:space:]]*=.*#command = /usr/bin/emptty#' \
+    /etc/dinit.d/emptty
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
