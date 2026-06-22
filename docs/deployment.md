@@ -71,5 +71,5 @@ can also run it on demand.
 
 `update` pulls the channel recorded in `source.conf`; if its deploy id already
 matches `current`, it is a no-op. Otherwise it stages and promotes. It transfers
-only the byte ranges of the slab covering objects the host lacks, so a small OS
+only the byte ranges of the pack covering objects the host lacks, so a small OS
 change pulls only the bytes it touched.

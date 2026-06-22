@@ -52,15 +52,15 @@ file is read, on every file, every time.
 
 ## Updates that cost only what changed
 
-Zerith stores objects as a **single slab blob plus an offset index** (two OCI blobs)
+Zerith stores objects as a **single pack blob plus an offset index** (two OCI blobs)
 and updates over **HTTP Range fetches**:
 
 - An update downloads **only the byte ranges covering changed objects**,
   coalesced into a handful of requests — so update bandwidth is proportional to
   the number of changed *bytes*, not the size of the layer that contains them.
-- A single changed file pulls its exact bytes out of the slab, rather than
+- A single changed file pulls its exact bytes out of the pack, rather than
   re-downloading a whole compressed layer.
-- Byte-identical slabs deduplicate automatically at the registry (same content →
+- Byte-identical packs deduplicate automatically at the registry (same content →
   same blob digest).
 
 On a rolling-release system, where updates scatter small changes across many

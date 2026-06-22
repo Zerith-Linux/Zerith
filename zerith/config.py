@@ -51,10 +51,10 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
         return default
 
 
-# Parallel slab range fetches. Each range is an independent network round trip,
+# Parallel pack range fetches. Each range is an independent network round trip,
 # so a small pool keeps the link busy between requests. See docs/objects.md.
 FETCH_JOBS = _env_int("ZERITH_FETCH_JOBS", 8, minimum=1)
 
 # Max gap (bytes of already-present data) to fold into a single HTTP Range
-# request when fetching from the slab blob. 0 disables coalescing.
+# request when fetching from the pack blob. 0 disables coalescing.
 COALESCE_GAP = _env_int("ZERITH_COALESCE_GAP", 1 << 20, minimum=0)

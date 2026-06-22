@@ -94,10 +94,10 @@ def _land_objects(deploy: Path, src: Source, shared: Path) -> None:
     """Dispatch to the right object-landing strategy for this source."""
     if src.local_objects is not None:
         objects.land_from_dir(src.local_objects, shared)
-    elif src.objects_slab:
-        objects.land_from_slab(src, shared)
+    elif src.objects_pack:
+        objects.land_from_pack(src, shared)
     else:
-        die("no object source (expected a local objects/ tree or a slab artifact)")
+        die("no object source (expected a local objects/ tree or a pack artifact)")
 
 
 def _place_root_cfs(src: Source, root_cfs: Path) -> None:
@@ -117,7 +117,7 @@ def _place_root_cfs(src: Source, root_cfs: Path) -> None:
 def stage(deploy: Path, src: Source) -> None:
     """Materialize a deployment (idempotent) and mark it ``staging``.
 
-    The slab path fetches only the byte ranges covering objects this image
+    The pack path fetches only the byte ranges covering objects this image
     lacks, computed from its own ``root.cfs`` against the shared store — no diff
     against the current deployment is needed.
     """

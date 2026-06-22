@@ -13,8 +13,8 @@ guards — while every non-trivial shell step delegates to a script under
 | Post-process rootfs                | `scripts/ci/post-process-rootfs.sh` | under `buildah unshare` |
 | Export rootfs                      | `scripts/ci/export-rootfs.sh` | on the runner |
 | Render composefs + build/sign UKI  | `scripts/ci/render-uki.sh` (outer) → `build-uki-in-container.sh` (inner) | inner runs inside `archlinux:base` as root |
-| Write deployment.json + pack slab  | `scripts/ci/pack-slab.sh` | on the runner |
-| Verify slab integrity              | `scripts/ci/verify-slab.py` | on the runner (pre-push gate) |
+| Write deployment.json + pack pack  | `scripts/ci/pack-objects.sh` | on the runner |
+| Verify pack integrity              | `scripts/ci/verify-pack.py` | on the runner (pre-push gate) |
 | Push deployment + objects          | `scripts/ci/push-artifacts.sh` | on the runner |
 | Cosign sign                        | `scripts/ci/cosign-sign.sh` | on the runner |
 
@@ -31,7 +31,7 @@ each step's `env:`. `scripts/lib/common.sh` provides shared `log` / `die` /
 `require_env` helpers, and each host-side script sources it; `require_env` fails
 fast with a clear message when a needed variable is missing.
 
-The one exception is `pack-slab.sh`, which appends the artifact refs it
+The one exception is `pack-objects.sh`, which appends the artifact refs it
 computes to `$GITHUB_ENV` *only when that variable is set* — so it is a no-op
 outside Actions and the script still runs cleanly when invoked by hand.
 

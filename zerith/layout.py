@@ -76,7 +76,7 @@ def write_meta(ddir: Path, src) -> None:
         "version": src.version,
         "composefs_digest": src.digest,
         "objects_ref": src.objects_ref,
-        "objects_slab": src.objects_slab,
+        "objects_pack": src.objects_pack,
         "objects_index": src.objects_index,
         "ref": src.ref,
         "deployed_at": now(),

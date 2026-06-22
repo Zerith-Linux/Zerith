@@ -19,14 +19,14 @@ fs-verity):
 
 - **Local directory** (`land_from_dir`) — copy from a CI output `objects/` tree,
   for offline `--local` installs.
-- **Object slab** (`land_from_slab`) — the network default (see below).
+- **Object pack** (`land_from_pack`) — the network default (see below).
 
-## The object slab and index
+## The object pack and index
 
-CI concatenates every object (sorted by digest) into one **slab blob** and
+CI concatenates every object (sorted by digest) into one **pack blob** and
 writes an **index** mapping each object's digest to its `[offset, length]` in
-the slab. Both are pushed as ordinary OCI blobs. Sorting by store path equals
-sorting by digest, so an unchanged set of objects produces a byte-identical slab
+the pack. Both are pushed as ordinary OCI blobs. Sorting by store path equals
+sorting by digest, so an unchanged set of objects produces a byte-identical pack
 — identical blob digest — and the registry deduplicates the whole push.
 
 The host fetches the small index once (whole, via `oras`), computes which
@@ -35,12 +35,12 @@ ranges covering those objects** with HTTP Range requests, coalescing objects
 that sit within `ZERITH_COALESCE_GAP` bytes of each other into one request.
 
 A single path serves both first install and incremental update: on a fresh
-install every object is missing, and because the slab is laid out contiguously
+install every object is missing, and because the pack is laid out contiguously
 the coalescer collapses the whole want-list into one Range spanning the entire
-slab — i.e. a single whole-slab download. An update fetches only the handful of
+pack — i.e. a single whole-pack download. An update fetches only the handful of
 ranges its changed objects touch. This was validated against the live GHCR
 registry (Range returns `206` with exact byte counts; fetched bytes verify
-against their fs-verity digest), so there is no separate whole-slab code path.
+against their fs-verity digest), so there is no separate whole-pack code path.
 
 > **Requirement:** the registry must honor HTTP Range on blob GETs. GHCR does.
 > If a registry ignored Range and returned a full body for a partial request,

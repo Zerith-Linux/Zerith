@@ -42,14 +42,14 @@ python3 zerithctl --dry-run --deploy /tmp/d --esp /tmp/e update
 
 ```sh
 python3 -m pytest -q                 # unit tests for pure logic
-python3 -m ruff check zerith/ zerithctl tests/ scripts/ci/verify-slab.py
-python3 -m py_compile zerith/*.py zerithctl scripts/ci/verify-slab.py
+python3 -m ruff check zerith/ zerithctl tests/ scripts/ci/verify-pack.py
+python3 -m py_compile zerith/*.py zerithctl scripts/ci/verify-pack.py
 shellcheck install scripts/lib/*.sh scripts/ci/*.sh
 shellcheck -s sh init
 ```
 
 Most CI steps are bash (`scripts/ci/*.sh`, linted with `shellcheck`); the
-slab-integrity gate is Python (`scripts/ci/verify-slab.py`, linted with `ruff`).
+pack-integrity gate is Python (`scripts/ci/verify-pack.py`, linted with `ruff`).
 
 Tests target functions with no I/O or filesystem-only behavior, constructing
 small fixtures in `tmp_path`. Network, signing, and partitioning paths are out

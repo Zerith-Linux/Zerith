@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Pre-push integrity gate.
 
-Confirm out/objects.slab + out/objects.index.gz reconstruct every object in
-out/objects/ byte-for-byte. A slab/index bug (wrong offset, truncated blob,
+Confirm out/objects.pack + out/objects.index.gz reconstruct every object in
+out/objects/ byte-for-byte. A pack/index bug (wrong offset, truncated blob,
 mis-sorted index) fails here, on the runner, instead of reaching the registry.
 See docs/objects.md and docs/ci-workflows.md.
 
-Reads out/objects.slab, out/objects.index.gz and out/objects/. No special tools.
+Reads out/objects.pack, out/objects.index.gz and out/objects/. No special tools.
 """
 from __future__ import annotations
 
@@ -14,13 +14,13 @@ import gzip
 import os
 import sys
 
-SLAB = "out/objects.slab"
+PACK = "out/objects.pack"
 INDEX = "out/objects.index.gz"
 STORE = "out/objects"
 
 
 def _die(msg: str) -> None:
-    print(f"verify-slab: {msg}", file=sys.stderr)
+    print(f"verify-pack: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -38,12 +38,12 @@ def _load_index() -> list[tuple[str, int, int]]:
 
 def verify() -> int:
     index = _load_index()
-    slab_size = os.path.getsize(SLAB)
+    pack_size = os.path.getsize(PACK)
     store_count = sum(len(files) for _, _, files in os.walk(STORE))
 
     errors = 0
     expected_off = 0
-    with open(SLAB, "rb") as slab:
+    with open(PACK, "rb") as pack:
         for digest, off, length in index:
             if off != expected_off:
                 print(f"  GAP/OVERLAP at {digest}: "
@@ -55,16 +55,16 @@ def verify() -> int:
                 print(f"  MISSING object file for index entry {digest}")
                 errors += 1
                 continue
-            slab.seek(off)
+            pack.seek(off)
             with open(obj_path, "rb") as obj:
-                if slab.read(length) != obj.read():
+                if pack.read(length) != obj.read():
                     print(f"  BYTE MISMATCH for {
                           digest} (off={off} len={length})")
                     errors += 1
 
-    if expected_off != slab_size:
-        print(f"  SLAB SIZE MISMATCH: index ends at {expected_off}, "
-              f"slab is {slab_size}")
+    if expected_off != pack_size:
+        print(f"  PACK SIZE MISMATCH: index ends at {expected_off}, "
+              f"pack is {pack_size}")
         errors += 1
     if len(index) != store_count:
         print(f"  COUNT MISMATCH: index has {
@@ -73,16 +73,16 @@ def verify() -> int:
 
     if errors:
         print(
-            f">> verify-slab: FAILED with {errors} error(s)", file=sys.stderr)
+            f">> verify-pack: FAILED with {errors} error(s)", file=sys.stderr)
         return 1
-    print(f">> verify-slab: OK — {len(index)} objects, {slab_size} bytes, "
+    print(f">> verify-pack: OK — {len(index)} objects, {pack_size} bytes, "
           f"contiguous and byte-identical to the object store")
     return 0
 
 
 def main() -> int:
-    if not os.path.isfile(SLAB):
-        _die(f"{SLAB} missing (run pack-slab first)")
+    if not os.path.isfile(PACK):
+        _die(f"{PACK} missing (run pack-objects first)")
     if not os.path.isfile(INDEX):
         _die(f"{INDEX} missing")
     if not os.path.isdir(STORE):

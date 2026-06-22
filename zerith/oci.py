@@ -123,13 +123,13 @@ class Source:
         return self.meta.get("objects_ref")
 
     @property
-    def objects_slab(self) -> dict:
-        """``{digest, size}`` of the single concatenated object slab blob."""
-        return self.meta.get("objects_slab") or {}
+    def objects_pack(self) -> dict:
+        """``{digest, size}`` of the single concatenated object pack blob."""
+        return self.meta.get("objects_pack") or {}
 
     @property
     def objects_index(self) -> dict:
-        """``{digest, size, encoding}`` of the slab's digest->offset index."""
+        """``{digest, size, encoding}`` of the pack's digest->offset index."""
         return self.meta.get("objects_index") or {}
 
     def cleanup(self) -> None:

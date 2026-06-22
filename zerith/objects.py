@@ -6,7 +6,7 @@ sha256 digest. Two landing strategies feed the store, both funnelling through
 :func:`place_object` (verify digest, move into place, seal with fs-verity):
 
 * :func:`land_from_dir`  — copy from a local ``objects/`` tree (offline install).
-* :func:`land_from_slab` — the single concatenated slab blob, fetched whole on a
+* :func:`land_from_pack` — the single concatenated pack blob, fetched whole on a
   fresh install or by HTTP Range for incremental updates.
 
 The fetch-strategy reasoning (coalescing, parallelism, holder refcounting) is in
@@ -112,11 +112,11 @@ def land_from_dir(src_objects: Path, shared: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The object slab: one concatenated blob (+ digest->offset index)
+# The object pack: one concatenated blob (+ digest->offset index)
 # --------------------------------------------------------------------------- #
 
 def _fetch_index(repo: str, idx_meta: dict) -> dict[str, tuple[int, int]]:
-    """Pull the small slab index blob whole and parse it into
+    """Pull the small pack index blob whole and parse it into
     ``{digest_hex: (offset, length)}``."""
     digest = idx_meta["digest"]
     staging = Path(tempfile.mkdtemp(prefix="zerith-idx-"))
@@ -148,7 +148,7 @@ def _coalesce_ranges(want: list[tuple[int, int, str]],
     """Merge ``(offset, length, digest)`` entries (sorted by offset) whose gap to
     the running range is ``<= gap`` bytes into one HTTP range, so scattered
     objects collapse into a handful of requests (and a fresh install, where
-    everything is missing, collapses into a single whole-slab stream). Each
+    everything is missing, collapses into a single whole-pack stream). Each
     returned range is ``(start, end, [(offset_within_range, length, digest)…])``.
     """
     ranges: list[tuple[int, int, list]] = []
@@ -172,13 +172,13 @@ def _coalesce_ranges(want: list[tuple[int, int, str]],
 def _fetch_range(registry: str, repo_path: str, blob_digest: str,
                  start: int, end: int, out_path: Path,
                  auth: str | None, show_progress: bool = False) -> Path:
-    """GET one byte range of the slab blob to ``out_path``. Safe in a worker
+    """GET one byte range of the pack blob to ``out_path``. Safe in a worker
     thread (touches only its own file + shells out to curl). ``curl -L`` follows
     the registry's redirect to backing storage, carrying the Range.
 
     When ``show_progress`` is set, curl draws its own progress bar on stderr
     (used for the single-range case, e.g. a fresh install pulling the whole
-    slab); otherwise it runs silently and its output is captured for error
+    pack); otherwise it runs silently and its output is captured for error
     reporting.
     """
     url = f"https://{registry}/v2/{repo_path}/blobs/{blob_digest}"
@@ -198,7 +198,7 @@ def _fetch_range(registry: str, repo_path: str, blob_digest: str,
 
 
 def _place_from_buffer(buf_path: Path, objs: list, shared: Path) -> int:
-    """Slice each object out of a fetched buffer (a range, or the whole slab),
+    """Slice each object out of a fetched buffer (a range, or the whole pack),
     verify + seal it, and place it in the shared store. Seeks per object so a big
     buffer never sits in memory all at once. Offsets are relative to the buffer.
     Returns how many objects were newly placed.
@@ -246,12 +246,12 @@ def _missing_objects(src, shared: Path,
     return want, inlined, present
 
 
-def land_from_slab(src, shared: Path) -> None:
-    """Materialize this image's objects from the single slab blob.
+def land_from_pack(src, shared: Path) -> None:
+    """Materialize this image's objects from the single pack blob.
 
     Fetches only the byte ranges covering objects we lack, coalescing nearby
     ones (:func:`_coalesce_ranges`). A fresh install — where every object is
-    missing — naturally collapses into a single whole-slab range, so this one
+    missing — naturally collapses into a single whole-pack range, so this one
     path serves both first install and incremental update (verified against
     GHCR; see docs/objects.md). :func:`place_object` re-checks every fs-verity
     digest before the object is trusted, and :func:`_fetch_range` rejects any
@@ -264,7 +264,7 @@ def land_from_slab(src, shared: Path) -> None:
     if not objects_ref:
         die("deployment metadata has no objects_ref")
     repo = ref_repo(objects_ref)
-    slab_digest = src.objects_slab["digest"]
+    pack_digest = src.objects_pack["digest"]
 
     index = _fetch_index(repo, src.objects_index)
     want, inlined, already_present = _missing_objects(src, shared, index)
@@ -275,10 +275,10 @@ def land_from_slab(src, shared: Path) -> None:
         log(f"objects: all {already_present} present, nothing to fetch")
         return
 
-    _land_slab_by_range(repo, slab_digest, want, shared, already_present)
+    _land_pack_by_range(repo, pack_digest, want, shared, already_present)
 
 
-def _land_slab_by_range(repo: str, slab_digest: str,
+def _land_pack_by_range(repo: str, pack_digest: str,
                         want: list[tuple[int, int, str]], shared: Path,
                         already_present: int) -> None:
     """Fetch only the byte ranges covering missing objects via HTTP Range."""
@@ -288,16 +288,16 @@ def _land_slab_by_range(repo: str, slab_digest: str,
 
     if runtime.DRY_RUN:
         log(f"[dry-run] {len(want)} object(s) via {len(ranges)} range "
-            f"request(s), ~{human_bytes(span)} from {slab_digest}")
+            f"request(s), ~{human_bytes(span)} from {pack_digest}")
         return
 
     auth = registry_auth_header(repo)
     registry, repo_path = repo.split("/", 1)
-    staging = Path(tempfile.mkdtemp(prefix="zerith-slab-"))
+    staging = Path(tempfile.mkdtemp(prefix="zerith-pack-"))
     try:
         new = 0
         jobs = max(1, min(config.FETCH_JOBS, len(ranges)))
-        # One range (e.g. a fresh whole-slab pull) has nothing for the per-range
+        # One range (e.g. a fresh whole-pack pull) has nothing for the per-range
         # bar to tick through, so let curl show its own byte-level meter instead.
         show_progress = len(ranges) == 1 and sys.stderr.isatty()
         prog = Progress(len(ranges), label="objects")
@@ -305,7 +305,7 @@ def _land_slab_by_range(repo: str, slab_digest: str,
             futures = {}
             for i, (start, end, objs) in enumerate(ranges):
                 fut = pool.submit(_fetch_range, registry, repo_path,
-                                  slab_digest, start, end, staging / f"r{i}",
+                                  pack_digest, start, end, staging / f"r{i}",
                                   auth, show_progress)
                 futures[fut] = (start, end, objs)
             for fut in as_completed(futures):
