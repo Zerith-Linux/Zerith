@@ -6,6 +6,13 @@ MANGO_CONFIG="$HOME/.config/mango/config.conf"
 VIBEPANEL_CONFIG="$HOME/.config/vibepanel/config.toml"
 [ -f "$VIBEPANEL_CONFIG" ] || VIBEPANEL_CONFIG="/etc/zerith/vibepanel.toml"
 
+# Audio: no systemd here, so start the PipeWire stack for this session.
+# WirePlumber is the session manager; pipewire-pulse provides PulseAudio
+# compatibility for apps (and the vibepanel audio widget).
+pipewire &
+wireplumber &
+pipewire-pulse &
+
 exec mango -c "$MANGO_CONFIG" \
     -s "vibepanel --config \"$VIBEPANEL_CONFIG\" & awww-daemon & veilad &" \
     >>"$HOME/.local/share/desktop-session.log" 2>&1

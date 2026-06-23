@@ -1,4 +1,5 @@
 ARG DEPLOY_ID
+ARG FLAVOR
 
 FROM docker.io/archlinux:base AS uki-builder
 
@@ -13,6 +14,13 @@ RUN chmod +x /init
 
 RUN pacman -Syu --noconfirm \
         linux-zen binutils util-linux busybox cpio systemd systemd-ukify composefs kmod zstd
+
+ARG FLAVOR
+# NVIDIA flavor only: build the GPU kernel module against this exact kernel
+# so it ships inside /usr/lib/modules (copied to the runtime layer below).
+RUN if [ "$FLAVOR" = "nvidia" ]; then \
+        pacman -S --noconfirm linux-zen-headers nvidia-open-dkms; \
+    fi
 
 RUN ls /usr/lib/modules | grep -v '^extramodules' | head -n1 > /kver
 
@@ -63,6 +71,8 @@ RUN cp /init "$INITRAMFS/init" && chmod +x "$INITRAMFS/init" && \
 RUN cp -a "/usr/lib/modules" /out/modules
 
 FROM docker.io/artixlinux/artixlinux:base-dinit
+
+ARG FLAVOR
 
 COPY --from=uki-builder /out/initramfs.img /usr/lib/zerith/initramfs.img
 COPY --from=uki-builder /out/modules /usr/lib/modules
@@ -124,7 +134,18 @@ RUN pacman -Syu --noconfirm \
     nvim \
     emacs \
     btop \
-    awww
+    awww \
+    elogind \
+    elogind-dinit \
+    pipewire \
+    pipewire-pulse \
+    pipewire-alsa \
+    pipewire-jack \
+    wireplumber \
+    pavucontrol \
+    rtkit \
+    dconf \
+    gsettings-desktop-schemas
 
 RUN set -eux; \
     VERSION="$(curl -fsSL https://api.github.com/repos/oras-project/oras/releases/latest | \
@@ -145,7 +166,7 @@ RUN set -eux; \
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     su aur -c "cd /home/aur && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm" && \
-    su aur -c "yay -S --noconfirm greetd-tuigreet-fork-bin mangowm vibepanel-bin veila-bin" && \
+    su aur -c "yay -S --noconfirm greetd-tuigreet-fork-bin mangowm vibepanel-bin veila-bin qgnomeplatform-qt6 qgnomeplatform-qt5" && \
     pacman -Rs --noconfirm base-devel yay-bin && \
     pacman -Scc --noconfirm && \
     userdel -r aur && \
@@ -155,6 +176,7 @@ RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN dinitctl -o enable NetworkManager && \
     dinitctl -o enable dbus && \
+    dinitctl -o enable elogind && \
     dinitctl -o enable greetd
 
 RUN mkdir -p /usr/etc/dinit.d && \
@@ -164,6 +186,24 @@ RUN mkdir -p /usr/lib/tmpfiles.d && \
     printf 'd /var/log/dinit 0755 root root -\n' > /usr/lib/tmpfiles.d/zerith-dinit.conf
 
 RUN echo "LIBSEAT_BACKEND=logind" >> /etc/environment
+
+# Qt apps follow the GTK theme stored in dconf/gsettings, on Wayland
+RUN printf '%s\n' \
+        'QT_QPA_PLATFORMTHEME=gnome' \
+        'QT_QPA_PLATFORM=wayland;xcb' \
+        >> /etc/environment
+
+# NVIDIA flavor only: userspace driver, modeset drop-in, and Wayland env vars.
+RUN if [ "$FLAVOR" = "nvidia" ]; then \
+        pacman -S --noconfirm nvidia-utils libva-nvidia-driver && \
+        printf 'options nvidia_drm modeset=1\n' > /etc/modprobe.d/nvidia.conf && \
+        printf '%s\n' \
+            'GBM_BACKEND=nvidia-drm' \
+            '__GLX_VENDOR_LIBRARY_NAME=nvidia' \
+            'WLR_NO_HARDWARE_CURSORS=1' \
+            >> /etc/environment; \
+    fi
+
 RUN echo 'ZERITH_COSIGN_IDENTITY=^https://github.com/Zerith-Linux/Zerith/\.github/workflows/build\.yml@refs/heads/.+$' >> /etc/environment
 
 RUN rm -rf /usr/lib/systemd /etc/systemd /var/lib/systemd

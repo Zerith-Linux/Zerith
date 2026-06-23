@@ -84,6 +84,7 @@ jobs:
           tags: localbuild
           build-args: |
             DEPLOY_ID=${{ steps.deploy_id.outputs.id }}
+            FLAVOR=${{ matrix.flavor }}
           oci: false
 
       # 2. Post-process the rootfs into the immutable layout (/usr/etc, factory /var).
