@@ -88,8 +88,8 @@ RUN pacman -Syu --noconfirm \
     networkmanager-dinit \
     shadow \
     sudo \
-    emptty \
-    emptty-dinit \
+    greetd \
+    greetd-dinit \
     curl \
     dhcpcd \
     iproute2 \
@@ -145,7 +145,7 @@ RUN set -eux; \
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     su aur -c "cd /home/aur && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm" && \
-    su aur -c "yay -S --noconfirm mangowm vibepanel-bin veila-bin" && \
+    su aur -c "yay -S --noconfirm greetd-tuigreet-fork-bin mangowm vibepanel-bin veila-bin" && \
     pacman -Rs --noconfirm base-devel yay-bin && \
     pacman -Scc --noconfirm && \
     userdel -r aur && \
@@ -155,10 +155,7 @@ RUN echo 'root:root' | chpasswd #for debugging purposes
 
 RUN dinitctl -o enable NetworkManager && \
     dinitctl -o enable dbus && \
-    dinitctl -o enable emptty
-
-RUN sed -i -E 's#^[[:space:]]*[Cc]ommand[[:space:]]*=.*#command = /usr/bin/emptty#' \
-    /etc/dinit.d/emptty
+    dinitctl -o enable greetd
 
 RUN mkdir -p /usr/etc/dinit.d && \
     printf 'type = internal\noptions = starts-rwfs\n' > /usr/etc/dinit.d/early-root-rw.target
