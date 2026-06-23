@@ -1,0 +1,51 @@
+[bar]
+position = "top"
+size = 32
+border_radius = 0
+background_opacity = 0.8
+
+[widgets]
+left = ["workspaces", "window_title"]
+center = ["media"]
+right = [
+  "tray",
+  "cpu",
+  "quick_settings",
+  "battery",
+  "clock",
+  "notifications",
+]
+border_radius = 32
+background_opacity = 1.0
+popover_background_opacity = 1.0
+
+[widgets.clock]
+format = "%I:%M %p"
+show_weather = false
+
+[widgets.window_title]
+template="{display}"
+
+[widgets.quick_settings]
+updates=false
+
+[theme]
+mode = "gtk"
+shadows=false
+outline = true
+outline_color = "subtle"
+
+[theme.icons]
+theme = "material"
+weight = 400
+
+[osd]
+enabled = true
+position = "bottom"
+show_value = false
+
+[audio]
+allow_overdrive = false
+
+[advanced]
+compositor = "mango"
