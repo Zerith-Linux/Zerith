@@ -145,6 +145,7 @@ RUN pacman -Syu --noconfirm \
     pavucontrol \
     rtkit \
     dconf \
+    adw-gtk-theme \
     gsettings-desktop-schemas
 
 RUN set -eux; \
@@ -166,7 +167,7 @@ RUN set -eux; \
 RUN useradd -m -G wheel aur && \
     echo "aur ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     su aur -c "cd /home/aur && git clone https://aur.archlinux.org/yay-bin.git && cd yay-bin && makepkg -si --noconfirm" && \
-    su aur -c "yay -S --noconfirm greetd-tuigreet-fork-bin mangowm vibepanel-bin veila-bin qgnomeplatform-qt6 qgnomeplatform-qt5" && \
+    su aur -c "yay -S --noconfirm greetd-tuigreet-fork-bin mangowm vibepanel-bin veila-bin " && \
     pacman -Rs --noconfirm base-devel yay-bin && \
     pacman -Scc --noconfirm && \
     userdel -r aur && \
@@ -187,13 +188,12 @@ RUN mkdir -p /usr/lib/tmpfiles.d && \
 
 RUN echo "LIBSEAT_BACKEND=logind" >> /etc/environment
 
-# Qt apps follow the GTK theme stored in dconf/gsettings, on Wayland
 RUN printf '%s\n' \
-        'QT_QPA_PLATFORMTHEME=gnome' \
+        'QT_QPA_PLATFORMTHEME=gtk3' \
+        'QT_QPA_PLATFORMTHEME_QT6=gtk3' \
         'QT_QPA_PLATFORM=wayland;xcb' \
         >> /etc/environment
 
-# NVIDIA flavor only: userspace driver, modeset drop-in, and Wayland env vars.
 RUN if [ "$FLAVOR" = "nvidia" ]; then \
         pacman -S --noconfirm nvidia-utils libva-nvidia-driver && \
         printf 'options nvidia_drm modeset=1\n' > /etc/modprobe.d/nvidia.conf && \
